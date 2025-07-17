@@ -266,6 +266,16 @@ async def get_frontend():
                 color: #666; 
                 font-style: italic; 
             }
+            .job a { 
+                color: #007bff; 
+                text-decoration: none; 
+                border-bottom: 1px dotted #007bff;
+            }
+            .job a:hover { 
+                color: #0056b3; 
+                text-decoration: underline;
+                border-bottom: 1px solid #0056b3;
+            }
             .error { color: red; }
             .success { color: green; }
             .cloud-badge { 
