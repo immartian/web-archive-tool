@@ -1,5 +1,6 @@
-from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Request
 from fastapi.responses import HTMLResponse, StreamingResponse
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, HttpUrl
 import asyncio
 import subprocess
@@ -12,27 +13,92 @@ import re
 import tempfile
 import shutil
 from pathlib import Path
+import sqlite3
+import docker
+import aiofiles
+from dotenv import load_dotenv
 
-# Google Cloud imports
-from google.cloud import storage
-from google.cloud import firestore
-import google.auth
+# Load environment variables from .env file
+load_dotenv()
 
-app = FastAPI(title="Web Archive API - Cloud Run")
+app = FastAPI(title="Web Archive API - Local Docker")
 
-# Google Cloud clients
-try:
-    storage_client = storage.Client()
-    firestore_client = firestore.Client()
-except Exception as e:
-    print(f"Warning: Google Cloud clients not initialized: {e}")
-    storage_client = None
-    firestore_client = None
+# Add CORS middleware for replayweb.page integration
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-# Configuration
-STORAGE_BUCKET = os.getenv("STORAGE_BUCKET", "web-archive-storage")
-PROJECT_ID = os.getenv("GOOGLE_CLOUD_PROJECT", "your-project-id")
+# Local configuration
+ARCHIVE_DIR = os.getenv("ARCHIVE_DIR", "./archives")
+DB_PATH = os.getenv("DB_PATH", "./data/archives.db")
 PORT = int(os.getenv("PORT", 8080))
+
+# Initialize Docker client
+docker_client = None
+try:
+    # Simply try to create a Docker client with the socket path
+    docker_client = docker.DockerClient(base_url='unix:///var/run/docker.sock')
+    # Test the connection
+    docker_client.ping()
+    print("✅ Docker client initialized successfully")
+except Exception as e:
+    print(f"❌ Docker client initialization failed: {e}")
+    print("   Make sure Docker is running and accessible")
+    docker_client = None
+
+# Ensure archive directory exists
+os.makedirs(ARCHIVE_DIR, exist_ok=True)
+
+# Initialize SQLite database
+def init_db():
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS archive_jobs (
+            job_id TEXT PRIMARY KEY,
+            url TEXT NOT NULL,
+            status TEXT NOT NULL,
+            progress INTEGER DEFAULT 0,
+            created_at TEXT NOT NULL,
+            completed_at TEXT,
+            archive_path TEXT,
+            local_path TEXT,
+            crawler_type TEXT,
+            crawler_reason TEXT,
+            complexity_score INTEGER DEFAULT 0,
+            gcs_url TEXT
+        )
+    ''')
+    
+    # Add gcs_url column if it doesn't exist (for existing databases)
+    try:
+        cursor.execute('ALTER TABLE archive_jobs ADD COLUMN gcs_url TEXT')
+    except sqlite3.OperationalError:
+        # Column already exists
+        pass
+    
+    # Add gcs_error column if it doesn't exist (for existing databases)
+    try:
+        cursor.execute('ALTER TABLE archive_jobs ADD COLUMN gcs_error TEXT')
+    except sqlite3.OperationalError:
+        # Column already exists
+        pass
+    
+    # Add pages_archived column if it doesn't exist (for existing databases)
+    try:
+        cursor.execute('ALTER TABLE archive_jobs ADD COLUMN pages_archived INTEGER DEFAULT 0')
+    except sqlite3.OperationalError:
+        # Column already exists
+        pass
+    
+    conn.commit()
+    conn.close()
+
+init_db()
 
 class ArchiveRequest(BaseModel):
     url: HttpUrl
@@ -45,67 +111,119 @@ class JobStatus(BaseModel):
     created_at: str
     completed_at: Optional[str] = None
     archive_path: Optional[str] = None
-    gcs_path: Optional[str] = None
+    local_path: Optional[str] = None
 
-class FirestoreJobManager:
-    def __init__(self, client):
-        self.client = client
-        self.collection = client.collection('archive_jobs')
+class SQLiteJobManager:
+    def __init__(self, db_path: str):
+        self.db_path = db_path
     
     async def create_job(self, job_data: dict) -> str:
-        doc_ref = self.collection.document(job_data['job_id'])
-        doc_ref.set(job_data)
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute('''
+            INSERT INTO archive_jobs 
+            (job_id, url, status, progress, created_at, completed_at, archive_path, local_path, crawler_type, crawler_reason, complexity_score)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (
+            job_data['job_id'], job_data['url'], job_data['status'], job_data['progress'],
+            job_data['created_at'], job_data.get('completed_at'), job_data.get('archive_path'),
+            job_data.get('local_path'), job_data.get('crawler_type'), job_data.get('crawler_reason'),
+            job_data.get('complexity_score', 0)
+        ))
+        conn.commit()
+        conn.close()
         return job_data['job_id']
     
     async def update_job(self, job_id: str, updates: dict):
-        doc_ref = self.collection.document(job_id)
-        doc_ref.update(updates)
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        
+        set_clause = ', '.join([f'{key} = ?' for key in updates.keys()])
+        values = list(updates.values()) + [job_id]
+        
+        cursor.execute(f'UPDATE archive_jobs SET {set_clause} WHERE job_id = ?', values)
+        conn.commit()
+        conn.close()
     
     async def get_job(self, job_id: str) -> Optional[dict]:
-        doc_ref = self.collection.document(job_id)
-        doc = doc_ref.get()
-        return doc.to_dict() if doc.exists else None
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute('SELECT * FROM archive_jobs WHERE job_id = ?', (job_id,))
+        row = cursor.fetchone()
+        
+        if row:
+            columns = [desc[0] for desc in cursor.description]
+            conn.close()
+            return dict(zip(columns, row))
+        conn.close()
+        return None
     
     async def get_all_jobs(self) -> List[dict]:
-        docs = self.collection.stream()
-        return [doc.to_dict() for doc in docs]
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute('SELECT * FROM archive_jobs ORDER BY created_at DESC')
+        rows = cursor.fetchall()
+        columns = [desc[0] for desc in cursor.description]
+        conn.close()
+        
+        return [dict(zip(columns, row)) for row in rows]
     
     async def get_completed_jobs(self) -> List[dict]:
-        docs = self.collection.where('status', '==', 'completed').stream()
-        return [doc.to_dict() for doc in docs]
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute('SELECT * FROM archive_jobs WHERE status = ? ORDER BY created_at DESC', ('completed',))
+        rows = cursor.fetchall()
+        columns = [desc[0] for desc in cursor.description]
+        conn.close()
+        
+        return [dict(zip(columns, row)) for row in rows]
+    
+    async def delete_job(self, job_id: str):
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute('DELETE FROM archive_jobs WHERE job_id = ?', (job_id,))
+        conn.commit()
+        conn.close()
 
 # Initialize job manager
-job_manager = FirestoreJobManager(firestore_client) if firestore_client else None
+job_manager = SQLiteJobManager(DB_PATH)
 
-class CloudStorageManager:
-    def __init__(self, client, bucket_name):
-        self.client = client
-        self.bucket_name = bucket_name
-        self.bucket = client.bucket(bucket_name) if client else None
+class LocalStorageManager:
+    def __init__(self, archive_dir: str):
+        self.archive_dir = archive_dir
+        os.makedirs(archive_dir, exist_ok=True)
     
-    async def upload_archive(self, local_path: str, job_id: str) -> str:
-        """Upload archive to GCS and return public URL"""
-        if not self.bucket:
-            return f"gs://{self.bucket_name}/archives/{job_id}/"
+    async def save_archive(self, content: str, job_id: str, filename: str) -> str:
+        """Save archive to local storage and return path"""
+        job_dir = os.path.join(self.archive_dir, job_id)
+        os.makedirs(job_dir, exist_ok=True)
         
-        blob_name = f"archives/{job_id}/{os.path.basename(local_path)}"
-        blob = self.bucket.blob(blob_name)
-        blob.upload_from_filename(local_path)
+        file_path = os.path.join(job_dir, filename)
+        async with aiofiles.open(file_path, 'w', encoding='utf-8') as f:
+            await f.write(content)
         
-        # Make the blob publicly readable
-        blob.make_public()
-        return blob.public_url
+        return file_path
+    
+    async def save_binary_archive(self, file_path: str, job_id: str, filename: str) -> str:
+        """Copy binary archive to local storage"""
+        job_dir = os.path.join(self.archive_dir, job_id)
+        os.makedirs(job_dir, exist_ok=True)
+        
+        dest_path = os.path.join(job_dir, filename)
+        shutil.copy2(file_path, dest_path)
+        
+        return dest_path
     
     async def list_archives(self, job_id: str) -> List[str]:
         """List all archives for a job"""
-        if not self.bucket:
+        job_dir = os.path.join(self.archive_dir, job_id)
+        if not os.path.exists(job_dir):
             return []
         
-        blobs = self.bucket.list_blobs(prefix=f"archives/{job_id}/")
-        return [blob.name for blob in blobs]
+        return [f for f in os.listdir(job_dir) if os.path.isfile(os.path.join(job_dir, f))]
 
 # Initialize storage manager
-storage_manager = CloudStorageManager(storage_client, STORAGE_BUCKET)
+storage_manager = LocalStorageManager(ARCHIVE_DIR)
 
 @app.get("/", response_class=HTMLResponse)
 async def get_frontend():
@@ -158,10 +276,18 @@ async def get_frontend():
                 font-size: 12px; 
                 margin-left: 10px; 
             }
+            .gcs-upload-btn { 
+                background: #4285f4; 
+                color: white; 
+                margin-left: 10px; 
+            }
+            .gcs-upload-btn:hover { 
+                background: #3367d6; 
+            }
         </style>
     </head>
     <body>
-        <h1>Web Archive Tool <span class="cloud-badge">Cloud Run</span></h1>
+        <h1>Web Archive Tool <span class="cloud-badge">Local Docker</span></h1>
         
         <div class="container">
             <h2>Archive a Website</h2>
@@ -187,9 +313,12 @@ async def get_frontend():
             function showMessage(text, type = 'info') {
                 const messageDiv = document.getElementById('message');
                 messageDiv.innerHTML = `<div class="${type}">${text}</div>`;
-                if (type !== 'error') {
-                    setTimeout(() => messageDiv.innerHTML = '', 3000);
+                
+                // Auto-hide only brief success messages, keep important info/error messages
+                if (type === 'success' && !text.includes('What happens next:')) {
+                    setTimeout(() => messageDiv.innerHTML = '', 5000);
                 }
+                // Keep error messages and detailed info messages visible
             }
 
             async function startArchive() {
@@ -198,6 +327,12 @@ async def get_frontend():
                     showMessage('Please enter a URL', 'error');
                     return;
                 }
+
+                // Show loading state
+                const archiveButton = document.querySelector('button[onclick="startArchive()"]');
+                const originalText = archiveButton.textContent;
+                archiveButton.textContent = '⏳ Creating...';
+                archiveButton.disabled = true;
 
                 try {
                     const response = await fetch('/api/archive', {
@@ -211,12 +346,18 @@ async def get_frontend():
                     }
 
                     const result = await response.json();
-                    showMessage(`Archive started! Job ID: ${result.job_id}`, 'success');
+                    showMessage(`📋 Archive job created! Check "Active Jobs" below for progress. Job ID: ${result.job_id}`, 'success');
                     document.getElementById('urlInput').value = '';
                     
+                    // Immediately load and display the new job
+                    await loadExistingArchives();
                     startProgressMonitoring();
                 } catch (error) {
                     showMessage(`Error: ${error.message}`, 'error');
+                } finally {
+                    // Restore button state
+                    archiveButton.textContent = originalText;
+                    archiveButton.disabled = false;
                 }
             }
 
@@ -271,14 +412,45 @@ async def get_frontend():
                 }
                 
                 const progressWidth = job.progress || 0;
-                const playbackButton = job.status === 'completed' && job.gcs_path ? 
-                    `<button class="playback-btn" onclick="playArchive('${job.gcs_path}')">📺 Play</button>` : '';
-                const downloadButton = job.status === 'completed' && job.gcs_path ? 
-                    `<button class="download-btn" onclick="downloadArchive('${job.gcs_path}')">⬇️ Download</button>` : '';
+                
+                // Determine play button behavior based on GCS URL availability
+                let playbackButton = '';
+                if (job.status === 'completed' && job.local_path) {
+                    if (job.gcs_url) {
+                        playbackButton = `<button class="playback-btn" onclick="playArchiveGCS('${job.gcs_url}')">📺 Play Online</button>`;
+                    } else {
+                        playbackButton = `<button class="playback-btn" onclick="playArchive('${job.local_path}')">📺 Play Local</button>`;
+                    }
+                }
+                
+                const downloadButton = job.status === 'completed' && job.local_path ? 
+                    `<button class="download-btn" onclick="downloadArchive('${job.local_path}')">⬇️ Download</button>` : '';
+                
+                // GCS upload button for completed jobs without GCS URL
+                let gcsUploadButton = '';
+                if (job.status === 'completed' && job.local_path && !job.gcs_url) {
+                    gcsUploadButton = `<button class="gcs-upload-btn" onclick="uploadToGCS('${job.job_id}')">☁️ Upload to Cloud</button>`;
+                } else if (job.status === 'uploading_gcs') {
+                    gcsUploadButton = `<button class="gcs-upload-btn" disabled>☁️ Uploading...</button>`;
+                } else if (job.status === 'gcs_upload_failed') {
+                    gcsUploadButton = `<button class="retry-btn" onclick="uploadToGCS('${job.job_id}')">☁️ Retry Upload</button>`;
+                }
+                
+                // Show GCS status for uploaded archives
+                let gcsStatus = '';
+                if (job.gcs_url) {
+                    gcsStatus = `<div><strong>Cloud:</strong> ✅ Available for online viewing</div>`;
+                } else if (job.status === 'uploading_gcs') {
+                    gcsStatus = `<div><strong>Cloud:</strong> 🔄 Uploading to cloud storage...</div>`;
+                } else if (job.status === 'gcs_upload_failed') {
+                    const errorMsg = job.gcs_error || 'Upload failed';
+                    gcsStatus = `<div><strong>Cloud:</strong> ❌ Upload failed - ${errorMsg}</div>`;
+                }
+                
                 const retryButton = job.status === 'failed' ? 
                     `<button class="retry-btn" onclick="retryJob('${job.job_id}')">🔄 Retry</button>` : '';
-                const deleteButton = job.status === 'failed' ? 
-                    `<button class="delete-btn" onclick="deleteJob('${job.job_id}')">🗑️ Delete</button>` : '';
+                const deleteButton = (job.status === 'failed' || job.status === 'completed') ? 
+                    `<button class="delete-btn" onclick="deleteArchive('${job.job_id}')">🗑️ Delete</button>` : '';
                 
                 const startedDate = job.created_at ? new Date(job.created_at).toLocaleString() : 'Unknown';
                 const completedDate = job.completed_at ? new Date(job.completed_at).toLocaleString() : null;
@@ -290,19 +462,29 @@ async def get_frontend():
                 const crawlerReason = job.crawler_reason ? 
                     `<div class="crawler-reason"><small>📋 ${job.crawler_reason}</small></div>` : '';
                 
+                // Create clickable URL
+                const clickableUrl = `<a href="${job.url}" target="_blank" rel="noopener noreferrer" style="color: #007bff; text-decoration: none;">${job.url}</a>`;
+                
+                // Add page count information
+                const pageInfo = job.pages_archived > 0 ? 
+                    `<div><strong>Pages Archived:</strong> ${job.pages_archived}</div>` : '';
+
                 return `
                     <div class="job">
-                        <div><strong>URL:</strong> ${job.url} ${crawlerBadge}</div>
+                        <div><strong>URL:</strong> ${clickableUrl} ${crawlerBadge}</div>
                         <div class="status"><strong>Status:</strong> ${job.status}</div>
                         <div class="progress">
                             <div class="progress-bar" style="width: ${progressWidth}%"></div>
                         </div>
                         <div>Progress: ${progressWidth}%</div>
+                        ${pageInfo}
                         <div><strong>Started:</strong> ${startedDate}</div>
                         ${completedDate ? `<div><strong>Completed:</strong> ${completedDate}</div>` : ''}
-                        ${job.gcs_path ? `<div><strong>Storage:</strong> Cloud Storage</div>` : ''}
+                        ${job.local_path ? `<div><strong>Storage:</strong> Local Storage</div>` : ''}
+                        ${gcsStatus}
                         ${crawlerReason}
                         ${playbackButton}
+                        ${gcsUploadButton}
                         ${downloadButton}
                         ${retryButton}
                         ${deleteButton}
@@ -310,75 +492,49 @@ async def get_frontend():
                 `;
             }
 
-            async function playArchive(gcsPath) {
+            async function playArchive(localPath) {
                 try {
-                    // For JSON archives, fetch and display the content
-                    if (gcsPath.endsWith('.json')) {
-                        const response = await fetch(gcsPath);
-                        const archiveData = await response.json();
-                        
-                        // Create a simple viewer window
-                        const viewerWindow = window.open('', '_blank', 'width=1000,height=700,scrollbars=yes');
-                        viewerWindow.document.write(`
-                            <html>
-                            <head>
-                                <title>Archive Viewer - ${archiveData.metadata.url}</title>
-                                <style>
-                                    body { font-family: Arial, sans-serif; margin: 20px; }
-                                    .metadata { background: #f5f5f5; padding: 15px; border-radius: 5px; margin-bottom: 20px; }
-                                    .page { border: 1px solid #ddd; margin: 10px 0; padding: 15px; border-radius: 5px; }
-                                    .page-header { background: #e9ecef; margin: -15px -15px 15px -15px; padding: 10px 15px; }
-                                    .content-preview { max-height: 200px; overflow-y: auto; background: #fafafa; padding: 10px; border-radius: 3px; }
-                                    pre { white-space: pre-wrap; }
-                                </style>
-                            </head>
-                            <body>
-                                <h1>📄 Archive Viewer</h1>
-                                <div class="metadata">
-                                    <h3>📋 Archive Metadata</h3>
-                                    <p><strong>URL:</strong> ${archiveData.metadata.url}</p>
-                                    <p><strong>Created:</strong> ${new Date(archiveData.metadata.created_at).toLocaleString()}</p>
-                                    <p><strong>Pages Crawled:</strong> ${archiveData.metadata.pages_crawled}</p>
-                                    <p><strong>Format:</strong> ${archiveData.metadata.format} v${archiveData.metadata.version}</p>
-                                </div>
-                                
-                                <h3>📑 Archived Pages (${archiveData.pages.length})</h3>
-                                ${archiveData.pages.map((page, index) => `
-                                    <div class="page">
-                                        <div class="page-header">
-                                            <strong>Page ${index + 1}:</strong> 
-                                            <a href="${page.url}" target="_blank">${page.url}</a>
-                                            <span style="float: right;">
-                                                Status: ${page.status_code} | 
-                                                Size: ${page.size} bytes | 
-                                                Type: ${page.content_type}
-                                            </span>
-                                        </div>
-                                        <div class="content-preview">
-                                            <strong>Content Preview:</strong>
-                                            <pre>${page.content.substring(0, 500)}${page.content.length > 500 ? '...' : ''}</pre>
-                                        </div>
-                                    </div>
-                                `).join('')}
-                                
-                                <p style="margin-top: 30px; text-align: center; color: #666;">
-                                    💡 This is a simple archive viewer. For full browsertrix-crawler archives, use replayweb.page
+                    // For local development, download and use local replayweb.page
+                    // Check if we're on localhost or any non-public domain
+                    const isLocalhost = window.location.hostname === 'localhost' || 
+                                      window.location.hostname === '127.0.0.1' || 
+                                      window.location.hostname === '0.0.0.0' ||
+                                      window.location.hostname.startsWith('192.168.') ||
+                                      window.location.hostname.startsWith('10.') ||
+                                      window.location.hostname.startsWith('172.');
+                    
+                    if (isLocalhost) {
+                        // Show instructions for local viewing
+                        const archiveUrl = `${window.location.origin}/api/serve/${localPath}`;
+                        const message = `
+                            <div style="margin: 10px 0;">
+                                <p><strong>To view this archive locally:</strong></p>
+                                <ol style="text-align: left; max-width: 500px; margin: 0 auto;">
+                                    <li>Download the WACZ file: <button onclick="downloadArchive('${localPath}')" style="margin-left: 5px;">Download</button></li>
+                                    <li>Go to <a href="https://replayweb.page/" target="_blank">replayweb.page</a></li>
+                                    <li>Click "Choose File" and select your downloaded WACZ file</li>
+                                    <li>Click "Start Exploring!" to view the archive</li>
+                                </ol>
+                                <p style="font-size: 12px; color: #666; margin-top: 10px;">
+                                    <strong>Why download?</strong> replayweb.page (HTTPS) cannot directly access localhost URLs (HTTP) for security reasons.<br>
+                                    <strong>Alternative:</strong> Use the "Upload to Cloud" button to make archives accessible online.
                                 </p>
-                            </body>
-                            </html>
-                        `);
-                        viewerWindow.document.close();
+                            </div>
+                        `;
+                        showMessage(message, 'info');
                     } else {
-                        // For WACZ files, use replayweb.page
-                        window.open(`https://replayweb.page/?source=${encodeURIComponent(gcsPath)}`, '_blank');
+                        // For production URLs, use direct replayweb.page integration
+                        const archiveUrl = `${window.location.origin}/api/serve/${localPath}`;
+                        const replayUrl = `https://replayweb.page/?source=${encodeURIComponent(archiveUrl)}`;
+                        window.open(replayUrl, '_blank');
                     }
                 } catch (error) {
                     showMessage(`Failed to open archive: ${error.message}`, 'error');
                 }
             }
 
-            async function downloadArchive(gcsPath) {
-                window.open(gcsPath, '_blank');
+            async function downloadArchive(localPath) {
+                window.open(`/api/download/${localPath}`, '_blank');
             }
 
             async function retryJob(jobId) {
@@ -424,6 +580,87 @@ async def get_frontend():
                 }
             }
 
+            async function deleteArchive(jobId) {
+                if (!confirm('Are you sure you want to permanently delete this archive? This will remove it from the database, local storage, and cloud storage.')) {
+                    return;
+                }
+                
+                try {
+                    const response = await fetch(`/api/delete-archive/${jobId}`, {
+                        method: 'DELETE',
+                        headers: { 'Content-Type': 'application/json' }
+                    });
+
+                    if (!response.ok) {
+                        const errorData = await response.json();
+                        throw new Error(errorData.detail || 'Failed to delete archive');
+                    }
+
+                    showMessage('Archive deleted successfully from all locations', 'success');
+                    // Remove from local jobs object
+                    delete jobs[jobId];
+                    // Refresh display
+                    updateJobList(Object.values(jobs));
+                } catch (error) {
+                    showMessage(`Delete error: ${error.message}`, 'error');
+                }
+            }
+
+            async function uploadToGCS(jobId) {
+                try {
+                    showMessage('Starting cloud upload...', 'info');
+                    
+                    const response = await fetch(`/api/upload-gcs/${jobId}`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' }
+                    });
+
+                    if (!response.ok) {
+                        const errorData = await response.json();
+                        throw new Error(errorData.detail || 'Failed to upload to cloud');
+                    }
+
+                    const result = await response.json();
+                    showMessage(`
+                        <div style="text-align: left; max-width: 600px; margin: 0 auto;">
+                            <p><strong>✅ Cloud upload started!</strong></p>
+                            <p>Your archive is being uploaded to Google Cloud Storage.</p>
+                            <p><strong>What happens next:</strong></p>
+                            <ul style="margin: 10px 0;">
+                                <li>📤 Archive will be uploaded to cloud storage (may take a few minutes)</li>
+                                <li>🔄 This page will automatically refresh to show upload progress</li>
+                                <li>📺 Once complete, you'll see a "Play Online" button that opens directly in replayweb.page</li>
+                                <li>🌐 The archive will be accessible from anywhere with the online link</li>
+                            </ul>
+                            <p style="color: #666; font-size: 12px;">Note: Large archives may take several minutes to upload.</p>
+                        </div>
+                    `, 'success');
+                } catch (error) {
+                    showMessage(`Upload error: ${error.message}`, 'error');
+                }
+            }
+
+            async function playArchiveGCS(gcsUrl) {
+                try {
+                    // Use proxy URL instead of direct GCS URL for better compatibility
+                    // Extract job_id from the gcs_url to build proxy URL
+                    // GCS URL format: .../archives/JOB_ID/archive-JOB_ID.wacz
+                    const jobIdMatch = gcsUrl.match(/\/archives\/([^\/]+)\/archive-/);
+                    if (jobIdMatch) {
+                        const jobId = jobIdMatch[1];
+                        // Try direct GCS URL first since proxy has issues
+                        const replayUrl = `https://replayweb.page/?source=${encodeURIComponent(gcsUrl)}`;
+                        window.open(replayUrl, '_blank');
+                    } else {
+                        // Fallback to direct GCS URL
+                        const replayUrl = `https://replayweb.page/?source=${encodeURIComponent(gcsUrl)}`;
+                        window.open(replayUrl, '_blank');
+                    }
+                } catch (error) {
+                    showMessage(`Failed to open archive: ${error.message}`, 'error');
+                }
+            }
+
             window.onload = function() {
                 startProgressMonitoring();
                 loadExistingArchives();
@@ -446,107 +683,32 @@ async def get_frontend():
     """
 
 def analyze_url_for_crawler_type(url: str) -> dict:
-    """Analyze URL to determine the best crawler type"""
+    """Always use browsertrix-crawler for professional web archiving"""
     from urllib.parse import urlparse
-    import requests
     
     parsed = urlparse(url)
     analysis = {
         "url": url,
         "domain": parsed.netloc.lower(),
         "path": parsed.path.lower(),
-        "recommended_crawler": "python",
-        "reason": "",
-        "complexity_score": 0
+        "recommended_crawler": "browsertrix",
+        "reason": "Professional web archiving with browsertrix-crawler",
+        "complexity_score": 1
     }
-    
-    complexity_score = 0
-    reasons = []
-    
-    # Domain-based analysis
-    spa_indicators = [
-        'app.', 'admin.', 'dashboard.', 'portal.',
-        'angular', 'react', 'vue', 'spa'
-    ]
-    
-    js_heavy_domains = [
-        'github.com', 'gitlab.com', 'codepen.io',
-        'jsfiddle.net', 'stackoverflow.com',
-        'medium.com', 'dev.to', 'hashnode.com',
-        'twitter.com', 'x.com', 'facebook.com',
-        'linkedin.com', 'instagram.com',
-        'youtube.com', 'vimeo.com', 'twitch.tv',
-        'gmail.com', 'outlook.com', 'notion.so',
-        'figma.com', 'canva.com', 'miro.com'
-    ]
-    
-    static_friendly_domains = [
-        'wikipedia.org', 'w3.org', 'mozilla.org',
-        'gnu.org', 'apache.org', 'nginx.org',
-        'docs.python.org', 'man7.org'
-    ]
-    
-    # Check domain patterns
-    if any(indicator in analysis["domain"] for indicator in spa_indicators):
-        complexity_score += 3
-        reasons.append("SPA-style domain detected")
-    
-    if any(domain in analysis["domain"] for domain in js_heavy_domains):
-        complexity_score += 4
-        reasons.append("JavaScript-heavy platform")
-    
-    if any(domain in analysis["domain"] for domain in static_friendly_domains):
-        complexity_score -= 2
-        reasons.append("Static-friendly site")
-    
-    # Path-based analysis
-    js_paths = ['/app/', '/dashboard/', '/admin/', '/spa/', '/react/', '/angular/']
-    if any(path in analysis["path"] for path in js_paths):
-        complexity_score += 2
-        reasons.append("Dynamic path detected")
-    
-    # Extension-based analysis
-    if analysis["path"].endswith(('.html', '.htm', '.txt', '.xml', '.rss')):
-        complexity_score -= 1
-        reasons.append("Static file extension")
-    
-    # Try a quick HEAD request to check response headers
-    try:
-        response = requests.head(url, timeout=5, allow_redirects=True)
-        content_type = response.headers.get('content-type', '').lower()
-        
-        # Check for SPA indicators in headers
-        if 'application/javascript' in content_type:
-            complexity_score += 2
-            reasons.append("JavaScript content type")
-        
-        # Check for framework indicators
-        framework_headers = ['x-powered-by', 'server']
-        for header in framework_headers:
-            value = response.headers.get(header, '').lower()
-            if any(fw in value for fw in ['express', 'next.js', 'nuxt', 'gatsby', 'react']):
-                complexity_score += 2
-                reasons.append(f"Framework detected in {header}")
-                
-    except Exception:
-        # If we can't check headers, assume medium complexity
-        complexity_score += 1
-        reasons.append("Unable to check headers")
-    
-    analysis["complexity_score"] = complexity_score
-    
-    # Always use browsertrix for proper WACZ archives that can be replayed
-    analysis["recommended_crawler"] = "browsertrix"
-    analysis["reason"] = f"Professional web archiving with browsertrix-crawler (score: {complexity_score}): " + "; ".join(reasons)
     
     return analysis
 
 @app.post("/api/archive")
 async def create_archive(request: ArchiveRequest, background_tasks: BackgroundTasks):
-    if not job_manager:
-        raise HTTPException(status_code=500, detail="Firestore not configured")
     
-    # Analyze URL to determine best crawler
+    # Check if Docker is available
+    if not docker_client:
+        raise HTTPException(
+            status_code=503, 
+            detail="Docker is not available. Please ensure Docker is running and accessible."
+        )
+    
+    # Always use browsertrix-crawler
     url = str(request.url)
     analysis = analyze_url_for_crawler_type(url)
     
@@ -559,39 +721,38 @@ async def create_archive(request: ArchiveRequest, background_tasks: BackgroundTa
         "created_at": datetime.now().isoformat(),
         "completed_at": None,
         "archive_path": None,
-        "gcs_path": None,
-        "crawler_type": analysis["recommended_crawler"],
+        "local_path": None,
+        "crawler_type": "browsertrix",
         "crawler_reason": analysis["reason"],
         "complexity_score": analysis["complexity_score"]
     }
     
     await job_manager.create_job(job_data)
     
-    # Choose crawler based on analysis
-    if analysis["recommended_crawler"] == "browsertrix":
-        background_tasks.add_task(run_browsertrix_crawler, job_id, url)
-    else:
-        background_tasks.add_task(run_python_crawler, job_id, url)
+    # Always use browsertrix-crawler
+    background_tasks.add_task(run_browsertrix_crawler, job_id, url)
     
     return {
         "job_id": job_id, 
         "status": "started",
-        "crawler_type": analysis["recommended_crawler"],
+        "crawler_type": "browsertrix",
         "reason": analysis["reason"]
     }
 
 @app.post("/api/retry/{job_id}")
 async def retry_archive(job_id: str, background_tasks: BackgroundTasks):
-    if not job_manager:
-        raise HTTPException(status_code=500, detail="Firestore not configured")
+    
+    # Check if Docker is available
+    if not docker_client:
+        raise HTTPException(
+            status_code=503, 
+            detail="Docker is not available. Please ensure Docker is running and accessible."
+        )
     
     # Get the existing job
     existing_job = await job_manager.get_job(job_id)
     if not existing_job:
         raise HTTPException(status_code=404, detail="Job not found")
-    
-    # Re-analyze the URL for crawler selection
-    analysis = analyze_url_for_crawler_type(existing_job["url"])
     
     # Reset the job to restart state
     await job_manager.update_job(job_id, {
@@ -600,23 +761,18 @@ async def retry_archive(job_id: str, background_tasks: BackgroundTasks):
         "created_at": datetime.now().isoformat(),
         "completed_at": None,
         "archive_path": None,
-        "gcs_path": None,
-        "crawler_type": analysis["recommended_crawler"],
-        "crawler_reason": analysis["reason"]
+        "local_path": None,
+        "crawler_type": "browsertrix",
+        "crawler_reason": "Professional web archiving with browsertrix-crawler"
     })
     
-    # Start the appropriate crawler
-    if analysis["recommended_crawler"] == "browsertrix":
-        background_tasks.add_task(run_browsertrix_crawler, job_id, existing_job["url"])
-    else:
-        background_tasks.add_task(run_python_crawler, job_id, existing_job["url"])
+    # Always use browsertrix-crawler
+    background_tasks.add_task(run_browsertrix_crawler, job_id, existing_job["url"])
     
     return {"job_id": job_id, "status": "restarted"}
 
 @app.delete("/api/delete/{job_id}")
 async def delete_job(job_id: str):
-    if not job_manager:
-        raise HTTPException(status_code=500, detail="Firestore not configured")
     
     # Get the job to check if it exists
     existing_job = await job_manager.get_job(job_id)
@@ -627,330 +783,308 @@ async def delete_job(job_id: str):
     if existing_job["status"] != "failed":
         raise HTTPException(status_code=400, detail="Only failed jobs can be deleted")
     
-    # Delete the job from Firestore
-    doc_ref = job_manager.collection.document(job_id)
-    doc_ref.delete()
+    # Delete the job from database
+    await job_manager.delete_job(job_id)
     
     return {"message": "Job deleted successfully", "job_id": job_id}
+
+@app.delete("/api/delete-archive/{job_id}")
+async def delete_archive(job_id: str):
+    """Delete archive from database, local storage, and cloud storage"""
+    
+    # Get the job to check if it exists
+    existing_job = await job_manager.get_job(job_id)
+    if not existing_job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    
+    # Only allow deletion of completed or failed jobs for safety
+    if existing_job["status"] not in ["completed", "failed", "gcs_upload_failed"]:
+        raise HTTPException(status_code=400, detail="Only completed or failed jobs can be deleted")
+    
+    results = {
+        "database": False,
+        "local_file": False,
+        "gcs_file": False,
+        "errors": []
+    }
+    
+    # 1. Delete from local file system
+    if existing_job.get("local_path"):
+        try:
+            import os
+            if os.path.exists(existing_job["local_path"]):
+                os.remove(existing_job["local_path"])
+                results["local_file"] = True
+            else:
+                results["local_file"] = True  # File doesn't exist, consider it deleted
+        except Exception as e:
+            results["errors"].append(f"Failed to delete local file: {str(e)}")
+    
+    # 2. Delete from Google Cloud Storage
+    if existing_job.get("gcs_url"):
+        try:
+            import google.cloud.storage
+            import os
+            from urllib.parse import urlparse
+            
+            # Parse GCS URL to get bucket and object name
+            # Format: https://storage.googleapis.com/bucket/path/to/file
+            parsed_url = urlparse(existing_job["gcs_url"])
+            path_parts = parsed_url.path.strip('/').split('/')
+            bucket_name = path_parts[0]
+            object_name = '/'.join(path_parts[1:])
+            
+            client = google.cloud.storage.Client()
+            bucket = client.bucket(bucket_name)
+            blob = bucket.blob(object_name)
+            
+            if blob.exists():
+                blob.delete()
+                results["gcs_file"] = True
+            else:
+                results["gcs_file"] = True  # File doesn't exist, consider it deleted
+                
+        except Exception as e:
+            results["errors"].append(f"Failed to delete GCS file: {str(e)}")
+    else:
+        results["gcs_file"] = True  # No GCS file to delete
+    
+    # 3. Delete from database (do this last in case of errors above)
+    try:
+        await job_manager.delete_job(job_id)
+        results["database"] = True
+    except Exception as e:
+        results["errors"].append(f"Failed to delete from database: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to delete from database: {str(e)}")
+    
+    # Check if all deletions were successful
+    success = results["database"] and results["local_file"] and results["gcs_file"]
+    
+    response = {
+        "message": "Archive deletion completed",
+        "job_id": job_id,
+        "success": success,
+        "results": results
+    }
+    
+    if not success:
+        response["message"] = "Archive deletion partially completed with errors"
+    
+    return response
+
+@app.post("/api/upload-gcs/{job_id}")
+async def upload_to_gcs(job_id: str, background_tasks: BackgroundTasks):
+    """Upload WACZ archive to Google Cloud Storage for replayweb.page access"""
+    
+    # Get the job to check if it exists and is completed
+    existing_job = await job_manager.get_job(job_id)
+    if not existing_job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    
+    if existing_job["status"] not in ["completed", "gcs_upload_failed"]:
+        raise HTTPException(status_code=400, detail="Only completed jobs can be uploaded to GCS")
+    
+    if existing_job.get("gcs_url"):
+        raise HTTPException(status_code=400, detail="Archive already uploaded to GCS")
+    
+    if not existing_job.get("local_path"):
+        raise HTTPException(status_code=400, detail="No local archive file found")
+    
+    # Check if GCS is configured before starting
+    try:
+        import google.cloud.storage
+        import os
+        if not os.getenv("GOOGLE_APPLICATION_CREDENTIALS") and not os.getenv("GCS_BUCKET"):
+            raise HTTPException(
+                status_code=503, 
+                detail="Google Cloud Storage is not configured. Please set GOOGLE_APPLICATION_CREDENTIALS and GCS_BUCKET environment variables."
+            )
+    except ImportError:
+        raise HTTPException(
+            status_code=503, 
+            detail="Google Cloud Storage library not installed. Run: pip install google-cloud-storage"
+        )
+    
+    # Start GCS upload in background
+    background_tasks.add_task(upload_archive_to_gcs, job_id, existing_job["local_path"])
+    
+    return {"message": "GCS upload started", "job_id": job_id}
 
 @app.get("/api/progress")
 async def get_progress():
     async def event_stream():
         while True:
-            if job_manager:
-                jobs = await job_manager.get_all_jobs()
-                # Filter out invalid jobs and send the complete job list
-                valid_jobs = [job for job in jobs if job and job.get('job_id') and job.get('url') and job.get('status')]
-                yield f"data: {json.dumps({'jobs': valid_jobs})}\n\n"
+            jobs = await job_manager.get_all_jobs()
+            # Filter out invalid jobs and send the complete job list
+            valid_jobs = [job for job in jobs if job and job.get('job_id') and job.get('url') and job.get('status')]
+            yield f"data: {json.dumps({'jobs': valid_jobs})}\n\n"
             await asyncio.sleep(2)
     
     return StreamingResponse(event_stream(), media_type="text/event-stream")
 
 @app.get("/api/archives")
 async def get_archives():
-    if not job_manager:
-        return []
     return await job_manager.get_completed_jobs()
 
 @app.get("/api/playback/{job_id}")
 async def playback_archive(job_id: str):
-    if not job_manager:
-        raise HTTPException(status_code=500, detail="Firestore not configured")
-    
     job = await job_manager.get_job(job_id)
-    if not job or not job.get('gcs_path'):
+    if not job or not job.get('local_path'):
         raise HTTPException(status_code=404, detail="Archive not found")
     
+    # Create full URL for replayweb.page
+    serve_url = f"/api/serve/{job['local_path']}"
+    
     return {
-        "playback_url": f"https://replayweb.page/?source={job['gcs_path']}",
-        "download_url": job['gcs_path']
+        "playback_url": f"https://replayweb.page/?source={serve_url}",
+        "download_url": f"/api/download/{job['local_path']}"
     }
 
-async def run_python_crawler(job_id: str, url: str):
-    """Background task to run simple Python-based web crawler"""
-    try:
-        await job_manager.update_job(job_id, {"status": "crawling", "progress": 10})
-        
-        import requests
-        from urllib.parse import urljoin, urlparse, quote
-        import time
-        
-        print(f"Starting to crawl {url} for job {job_id}")
-        
-        # Set up session with proper headers
-        session = requests.Session()
-        session.headers.update({
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8',
-            'Accept-Language': 'en-US,en;q=0.9,zh-CN,zh;q=0.8',
-            'Accept-Encoding': 'gzip, deflate, br',
-            'Connection': 'keep-alive',
-            'Upgrade-Insecure-Requests': '1',
-            'Cache-Control': 'max-age=0'
-        })
-        
-        # Test the main URL first
-        print(f"Testing connectivity to {url}...")
-        try:
-            test_response = session.head(url, timeout=10, allow_redirects=True)
-            print(f"HEAD request result: {test_response.status_code}")
-        except Exception as test_error:
-            print(f"HEAD request failed: {test_error}, proceeding with GET...")
-        
-        await job_manager.update_job(job_id, {"progress": 30})
-        
-        # Archive data structure
-        archive_data = {
-            'metadata': {
-                'job_id': job_id,
-                'url': url,
-                'created_at': datetime.now().isoformat(),
-                'format': 'simple-web-archive',
-                'version': '1.0'
-            },
-            'pages': []
-        }
-        
-        pages_to_crawl = [url]
-        crawled_urls = set()
-        max_pages = 5
-        
-        for i, current_url in enumerate(pages_to_crawl[:max_pages]):
-            if current_url in crawled_urls:
-                continue
-                
-            try:
-                print(f"Crawling page {i+1}/{min(len(pages_to_crawl), max_pages)}: {current_url}")
-                
-                # Update progress
-                progress = 30 + (i * 40 // max_pages)
-                await job_manager.update_job(job_id, {"progress": progress})
-                
-                # Add a small delay to make it more realistic
-                import asyncio
-                await asyncio.sleep(2)
-                
-                # Fetch the page
-                print(f"Fetching {current_url}...")
-                response = session.get(current_url, timeout=30, allow_redirects=True)
-                print(f"Response: {response.status_code} - {len(response.content)} bytes")
-                
-                # Don't raise for status immediately - let's see what we got
-                if response.status_code >= 400:
-                    print(f"HTTP {response.status_code} error for {current_url}")
-                    print(f"Response headers: {dict(response.headers)}")
-                    if response.status_code == 404:
-                        print("404 error - skipping this URL")
-                        continue
-                else:
-                    print(f"Successfully fetched {current_url} - {len(response.content)} bytes")
-                
-                # Store page data
-                page_data = {
-                    'url': current_url,
-                    'final_url': response.url,
-                    'status_code': response.status_code,
-                    'headers': dict(response.headers),
-                    'content': response.text,
-                    'content_type': response.headers.get('content-type', ''),
-                    'crawled_at': datetime.now().isoformat(),
-                    'size': len(response.content)
-                }
-                
-                archive_data['pages'].append(page_data)
-                crawled_urls.add(current_url)
-                
-                # Try to find more links (only for the first page to keep it simple)
-                if i == 0 and 'text/html' in response.headers.get('content-type', ''):
-                    try:
-                        from bs4 import BeautifulSoup
-                        soup = BeautifulSoup(response.text, 'html.parser')
-                        links = soup.find_all('a', href=True)
-                        
-                        for link in links[:10]:  # Limit to 10 links
-                            href = link['href']
-                            full_url = urljoin(current_url, href)
-                            parsed = urlparse(full_url)
-                            
-                            # Only crawl same domain, http/https links
-                            if (parsed.netloc == urlparse(url).netloc and 
-                                parsed.scheme in ['http', 'https'] and
-                                full_url not in crawled_urls):
-                                pages_to_crawl.append(full_url)
-                                
-                    except Exception as link_error:
-                        print(f"Error parsing links: {link_error}")
-                
-                # Small delay to be respectful
-                time.sleep(1)
-                
-            except Exception as page_error:
-                print(f"Error crawling {current_url}: {page_error}")
-                # Continue with other pages
-                continue
-        
-        await job_manager.update_job(job_id, {"progress": 80})
-        
-        # Update metadata with final stats
-        archive_data['metadata']['pages_crawled'] = len(archive_data['pages'])
-        archive_data['metadata']['completed_at'] = datetime.now().isoformat()
-        
-        if len(archive_data['pages']) == 0:
-            print(f"No pages were successfully crawled from {url}")
-            await job_manager.update_job(job_id, {
-                "status": "failed", 
-                "progress": 0,
-                "crawler_reason": "No pages could be crawled - site may be unreachable or blocking requests"
-            })
-            return
-        
-        print(f"Creating archive with {len(archive_data['pages'])} pages...")
-        
-        # Create the archive file
-        archive_content = json.dumps(archive_data, indent=2, ensure_ascii=False)
-        
-        # Upload to Google Cloud Storage
-        bucket = storage_client.bucket(STORAGE_BUCKET)
-        blob_name = f"archives/{job_id}/archive-{job_id}.json"
-        blob = bucket.blob(blob_name)
-        
-        print(f"Uploading archive to GCS: {blob_name}")
-        blob.upload_from_string(
-            archive_content, 
-            content_type='application/json; charset=utf-8'
-        )
-        blob.make_public()
-        print(f"Archive uploaded successfully: {blob.public_url}")
-        
-        await job_manager.update_job(job_id, {
-            "status": "completed",
-            "progress": 100,
-            "completed_at": datetime.now().isoformat(),
-            "archive_path": f"archive-{job_id}.json",
-            "gcs_path": blob.public_url
-        })
-        
-        print(f"Successfully archived {len(archive_data['pages'])} pages from {url}")
-        
-    except Exception as e:
-        await job_manager.update_job(job_id, {"status": "failed", "progress": 0})
-        print(f"Error running python crawler: {e}")
-        import traceback
-        traceback.print_exc()
 
 async def run_browsertrix_crawler(job_id: str, url: str):
-    """Background task to create WACZ-compatible archive"""
+    """Background task to run browsertrix-crawler in Docker"""
     try:
         await job_manager.update_job(job_id, {"status": "crawling", "progress": 10})
         
-        print(f"Creating WACZ archive for {url} (job {job_id})")
+        print(f"Starting browsertrix-crawler for {url} (job {job_id})")
         
-        # For now, create a proper WACZ structure that replayweb.page can use
-        # This is a simplified approach that works reliably
-        import zipfile
-        import tempfile
-        import json
-        import requests
-        from urllib.parse import urljoin, urlparse
-        from bs4 import BeautifulSoup
-        import time
+        if not docker_client:
+            raise Exception("Docker client not available")
         
-        await job_manager.update_job(job_id, {"progress": 30})
-        
-        # Create temporary directory for WACZ creation
-        temp_dir = tempfile.mkdtemp(prefix=f"wacz_{job_id}_")
+        # Create temporary directory for crawler output
+        temp_dir = tempfile.mkdtemp(prefix=f"crawl_{job_id}_")
         print(f"Created temp directory: {temp_dir}")
         
         try:
-            # Set up session with proper headers
-            session = requests.Session()
-            session.headers.update({
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-            })
+            await job_manager.update_job(job_id, {"progress": 20})
             
-            # Fetch the main page
-            print(f"Fetching {url}...")
-            response = session.get(url, timeout=30, allow_redirects=True)
-            response.raise_for_status()
-            
-            await job_manager.update_job(job_id, {"progress": 50})
-            
-            # Create WACZ structure
-            wacz_data = {
-                "pages": [
-                    {
-                        "id": f"page:{job_id}:0",
-                        "url": url,
-                        "title": "Archived Page",
-                        "ts": int(time.time() * 1000),
-                        "filename": "data.warc"
-                    }
-                ],
-                "resources": [
-                    {
-                        "name": "data.warc",
-                        "path": "data.warc",
-                        "hash": "sha256:placeholder",
-                        "bytes": len(response.content)
-                    }
-                ]
+            # Configure browsertrix-crawler parameters for comprehensive crawling
+            crawler_config = {
+                "url": url,
+                "collection": f"archive-{job_id}",
+                "depth": 3,
+                "limit": 50,
+                "timeout": 600,
+                "workers": 2,
+                "screenshot": "view",
+                "screencastTimeout": 10,
+                "behaviors": "autoscroll,autoplay,autofetch,siteSpecific",
+                "userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                "scopeType": "prefix",
+                "include": "same-domain"
             }
             
-            # Create a simple WARC-like structure for replayweb.page
-            warc_content = f"""WARC/1.0\r
-WARC-Type: response\r
-WARC-Target-URI: {url}\r
-WARC-Date: {datetime.now().strftime('%Y-%m-%dT%H:%M:%SZ')}\r
-Content-Type: text/html\r
-Content-Length: {len(response.content)}\r
-\r
-{response.text}"""
+            # Build crawler command
+            crawler_cmd = [
+                "crawl",
+                "--url", url,
+                "--collection", crawler_config["collection"],
+                "--depth", str(crawler_config["depth"]),
+                "--limit", str(crawler_config["limit"]),
+                "--timeout", str(crawler_config["timeout"]),
+                "--workers", str(crawler_config["workers"]),
+                "--screenshot", crawler_config["screenshot"],
+                "--screencastTimeout", str(crawler_config["screencastTimeout"]),
+                "--behaviors", crawler_config["behaviors"],
+                "--userAgent", crawler_config["userAgent"],
+                "--scopeType", crawler_config["scopeType"],
+                "--include", crawler_config["include"],
+                "--generateWACZ",
+                "--text",
+                "--logging", "info"
+            ]
             
-            await job_manager.update_job(job_id, {"progress": 70})
+            print(f"Running browsertrix-crawler with command: {' '.join(crawler_cmd)}")
             
-            # Create WACZ file
-            wacz_file = os.path.join(temp_dir, f"archive-{job_id}.wacz")
-            with zipfile.ZipFile(wacz_file, 'w', zipfile.ZIP_DEFLATED) as zf:
-                # Add metadata
-                zf.writestr("datapackage.json", json.dumps(wacz_data, indent=2))
-                # Add WARC data
-                zf.writestr("data.warc", warc_content)
-                # Add index for replayweb.page
-                index_data = {
-                    "cdx": [
-                        {
-                            "url": url,
-                            "timestamp": datetime.now().strftime('%Y%m%d%H%M%S'),
-                            "mime": "text/html",
-                            "status": str(response.status_code),
-                            "digest": "sha1:placeholder",
-                            "filename": "data.warc",
-                            "offset": "0",
-                            "length": str(len(warc_content))
-                        }
-                    ]
-                }
-                zf.writestr("indexes/index.cdx.gz", json.dumps(index_data))
+            await job_manager.update_job(job_id, {"progress": 30})
             
-            print(f"Created WACZ file: {wacz_file}")
-            await job_manager.update_job(job_id, {"progress": 85})
+            # Run browsertrix-crawler in Docker
+            container = docker_client.containers.run(
+                "webrecorder/browsertrix-crawler:latest",
+                command=crawler_cmd,
+                volumes={
+                    temp_dir: {"bind": "/crawls", "mode": "rw"}
+                },
+                environment={
+                    "CRAWL_ID": job_id,
+                    "STORE_USER": "1000",
+                    "STORE_GROUP": "1000"
+                },
+                remove=True,
+                detach=True,
+                stdout=True,
+                stderr=True,
+                user="1000:1000"
+            )
             
-            # Upload to Google Cloud Storage
-            bucket = storage_client.bucket(STORAGE_BUCKET)
-            blob_name = f"archives/{job_id}/archive-{job_id}.wacz"
-            blob = bucket.blob(blob_name)
+            print(f"Container started: {container.id}")
             
-            print(f"Uploading WACZ to GCS: {blob_name}")
-            blob.upload_from_filename(wacz_file)
-            blob.make_public()
-            print(f"WACZ uploaded successfully: {blob.public_url}")
+            # Monitor container progress
+            progress = 30
+            pages_archived = 0
+            for log_line in container.logs(stream=True, follow=True):
+                log_text = log_line.decode('utf-8').strip()
+                print(f"Crawler: {log_text}")
+                
+                # Parse progress and page count from logs
+                if "pages crawled" in log_text.lower():
+                    progress = min(progress + 5, 80)
+                    # Try to extract page count from log line
+                    # Format examples: "10 pages crawled", "Crawled 15 pages", etc.
+                    import re
+                    page_match = re.search(r'(\d+)\s+pages?\s+crawled|crawled\s+(\d+)\s+pages?', log_text.lower())
+                    if page_match:
+                        pages_archived = int(page_match.group(1) or page_match.group(2))
+                        await job_manager.update_job(job_id, {"progress": progress, "pages_archived": pages_archived})
+                    else:
+                        await job_manager.update_job(job_id, {"progress": progress})
+                elif "finished" in log_text.lower() or "done" in log_text.lower():
+                    progress = 85
+                    # Try to extract final page count from completion message
+                    import re
+                    page_match = re.search(r'(\d+)\s+pages?\s+crawled|crawled\s+(\d+)\s+pages?|(\d+)\s+pages?\s+total', log_text.lower())
+                    if page_match:
+                        pages_archived = int(page_match.group(1) or page_match.group(2) or page_match.group(3))
+                    await job_manager.update_job(job_id, {"progress": progress, "pages_archived": pages_archived})
+                elif "error" in log_text.lower():
+                    print(f"Crawler error: {log_text}")
+            
+            # Wait for container to complete
+            result = container.wait()
+            exit_code = result['StatusCode']
+            
+            if exit_code != 0:
+                raise Exception(f"Crawler failed with exit code {exit_code}")
+            
+            await job_manager.update_job(job_id, {"progress": 90})
+            
+            # Find the generated WACZ file
+            wacz_files = []
+            for root, dirs, files in os.walk(temp_dir):
+                for file in files:
+                    if file.endswith('.wacz'):
+                        wacz_files.append(os.path.join(root, file))
+            
+            if not wacz_files:
+                raise Exception("No WACZ file generated by crawler")
+            
+            # Use the first WACZ file found
+            wacz_file = wacz_files[0]
+            print(f"Found WACZ file: {wacz_file}")
+            
+            # Save to local storage with simple filename for replayweb.page compatibility
+            filename = f"{job_id[:8]}.wacz"
+            local_path = await storage_manager.save_binary_archive(wacz_file, job_id, filename)
+            
+            print(f"WACZ saved to local storage: {local_path}")
             
             await job_manager.update_job(job_id, {
                 "status": "completed",
                 "progress": 100,
                 "completed_at": datetime.now().isoformat(),
-                "archive_path": f"archive-{job_id}.wacz",
-                "gcs_path": blob.public_url
+                "archive_path": filename,
+                "local_path": f"{job_id}/{filename}",
+                "pages_archived": pages_archived
             })
             
             print(f"Successfully created WACZ archive for {url}")
@@ -958,7 +1092,6 @@ Content-Length: {len(response.content)}\r
         finally:
             # Clean up temp directory
             try:
-                import shutil
                 shutil.rmtree(temp_dir)
                 print(f"Cleaned up temp directory: {temp_dir}")
             except Exception as cleanup_error:
@@ -966,7 +1099,7 @@ Content-Length: {len(response.content)}\r
                 
     except Exception as e:
         await job_manager.update_job(job_id, {"status": "failed", "progress": 0})
-        print(f"Error creating WACZ archive: {e}")
+        print(f"Error running browsertrix-crawler: {e}")
         import traceback
         traceback.print_exc()
 
@@ -982,6 +1115,268 @@ def parse_crawler_progress(output: str) -> Optional[int]:
         return 100
     
     return None
+
+async def upload_archive_to_gcs(job_id: str, local_path: str):
+    """Background task to upload WACZ archive to Google Cloud Storage"""
+    try:
+        print(f"Starting GCS upload for job {job_id}")
+        
+        # Update job status to indicate upload in progress
+        await job_manager.update_job(job_id, {"status": "uploading_gcs"})
+        
+        # Check if GCS credentials are available
+        try:
+            from google.cloud import storage
+            import os
+            
+            # Check for GCS credentials
+            if not os.getenv("GOOGLE_APPLICATION_CREDENTIALS") and not os.getenv("GCS_BUCKET"):
+                raise Exception("GCS credentials or bucket not configured")
+            
+            bucket_name = os.getenv("GCS_BUCKET", "web-archives-bucket")
+            
+            # Initialize GCS client
+            client = storage.Client()
+            bucket = client.bucket(bucket_name)
+            
+            # Create simple blob name for replayweb.page compatibility
+            file_path = os.path.join(ARCHIVE_DIR, local_path)
+            simple_filename = f"{job_id[:8]}.wacz"
+            blob_name = f"archives/{simple_filename}"
+            blob = bucket.blob(blob_name)
+            
+            print(f"Uploading {file_path} to gs://{bucket_name}/{blob_name}")
+            
+            # Update progress
+            await job_manager.update_job(job_id, {"progress": 50})
+            
+            # Upload file
+            blob.upload_from_filename(file_path)
+            
+            # Update progress after upload
+            await job_manager.update_job(job_id, {"progress": 90})
+            
+            # Make blob publicly readable
+            blob.make_public()
+            
+            # Get public URL
+            gcs_url = blob.public_url
+            
+            print(f"Successfully uploaded to GCS: {gcs_url}")
+            
+            # Update job with GCS URL and restore completed status
+            await job_manager.update_job(job_id, {
+                "status": "completed",
+                "gcs_url": gcs_url
+            })
+            
+        except ImportError:
+            raise Exception("Google Cloud Storage library not installed. Run: pip install google-cloud-storage")
+        except Exception as gcs_error:
+            raise Exception(f"GCS upload failed: {gcs_error}")
+            
+    except Exception as e:
+        error_msg = str(e)
+        print(f"Error uploading to GCS: {error_msg}")
+        
+        # Update job with error status and message
+        await job_manager.update_job(job_id, {
+            "status": "gcs_upload_failed",
+            "gcs_error": error_msg
+        })
+        import traceback
+        traceback.print_exc()
+
+@app.get("/api/download/{job_id}/{filename}")
+async def download_archive(job_id: str, filename: str):
+    file_path = os.path.join(ARCHIVE_DIR, job_id, filename)
+    if not os.path.exists(file_path):
+        raise HTTPException(status_code=404, detail="Archive file not found")
+    
+    from fastapi.responses import FileResponse
+    return FileResponse(file_path, filename=filename)
+
+@app.get("/api/download/{local_path:path}")
+async def download_archive_by_path(local_path: str):
+    """Download archive using the full local path (job_id/filename format)"""
+    file_path = os.path.join(ARCHIVE_DIR, local_path)
+    if not os.path.exists(file_path):
+        raise HTTPException(status_code=404, detail="Archive file not found")
+    
+    from fastapi.responses import FileResponse
+    filename = os.path.basename(file_path)
+    return FileResponse(file_path, filename=filename)
+
+@app.options("/api/serve/{job_id}/{filename}")
+async def serve_archive_options(job_id: str, filename: str):
+    """Handle CORS preflight requests for archive serving"""
+    from fastapi.responses import Response
+    headers = {
+        "Access-Control-Allow-Origin": "*",
+        "Access-Control-Allow-Methods": "GET, HEAD, OPTIONS",
+        "Access-Control-Allow-Headers": "*",
+        "Access-Control-Max-Age": "86400"
+    }
+    return Response(headers=headers)
+
+@app.get("/api/serve/{job_id}/{filename}")
+@app.head("/api/serve/{job_id}/{filename}")
+async def serve_archive(job_id: str, filename: str, request: Request):
+    """Serve archive files with range request support for replayweb.page"""
+    from fastapi.responses import Response, StreamingResponse
+    import mimetypes
+    
+    file_path = os.path.join(ARCHIVE_DIR, job_id, filename)
+    if not os.path.exists(file_path):
+        raise HTTPException(status_code=404, detail="Archive file not found")
+    
+    file_size = os.path.getsize(file_path)
+    
+    # Set content type - WACZ files should be served as application/wacz
+    if filename.endswith('.wacz'):
+        content_type = "application/wacz"
+    else:
+        content_type = mimetypes.guess_type(filename)[0] or "application/octet-stream"
+    
+    # Common headers
+    headers = {
+        "Accept-Ranges": "bytes",
+        "Content-Type": content_type,
+        "Access-Control-Allow-Origin": "*",
+        "Access-Control-Allow-Methods": "GET, HEAD, OPTIONS",
+        "Access-Control-Allow-Headers": "*",
+        "Access-Control-Expose-Headers": "Accept-Ranges, Content-Length, Content-Range",
+        "Cross-Origin-Embedder-Policy": "require-corp",
+        "Cross-Origin-Opener-Policy": "same-origin"
+    }
+    
+    # Handle HEAD requests
+    if request.method == "HEAD":
+        headers["Content-Length"] = str(file_size)
+        return Response(headers=headers)
+    
+    # Handle range requests
+    range_header = request.headers.get("range")
+    if range_header:
+        try:
+            # Parse range header (e.g., "bytes=0-1023")
+            range_match = range_header.replace("bytes=", "").split("-")
+            start = int(range_match[0]) if range_match[0] else 0
+            end = int(range_match[1]) if range_match[1] else file_size - 1
+            
+            # Validate range
+            if start >= file_size or end >= file_size or start > end:
+                headers["Content-Range"] = f"bytes */{file_size}"
+                return Response(status_code=416, headers=headers)
+            
+            # Set range response headers
+            content_length = end - start + 1
+            headers.update({
+                "Content-Length": str(content_length),
+                "Content-Range": f"bytes {start}-{end}/{file_size}"
+            })
+            
+            # Stream the requested range
+            async def stream_range():
+                with open(file_path, "rb") as f:
+                    f.seek(start)
+                    remaining = content_length
+                    while remaining > 0:
+                        chunk_size = min(8192, remaining)
+                        chunk = f.read(chunk_size)
+                        if not chunk:
+                            break
+                        remaining -= len(chunk)
+                        yield chunk
+            
+            return StreamingResponse(stream_range(), status_code=206, headers=headers)
+        
+        except (ValueError, IndexError):
+            # Invalid range header, fall back to full file
+            pass
+    
+    # Serve full file
+    headers["Content-Length"] = str(file_size)
+    
+    async def stream_file():
+        with open(file_path, "rb") as f:
+            while True:
+                chunk = f.read(8192)
+                if not chunk:
+                    break
+                yield chunk
+    
+    return StreamingResponse(stream_file(), headers=headers)
+
+@app.get("/api/gcs-proxy/{job_id}")
+@app.head("/api/gcs-proxy/{job_id}")
+async def gcs_proxy(job_id: str, request: Request):
+    """Proxy GCS WACZ files with proper headers for replayweb.page"""
+    from fastapi.responses import StreamingResponse, Response
+    import aiohttp
+    
+    # Get job to find GCS URL
+    job = await job_manager.get_job(job_id)
+    if not job or not job.get('gcs_url'):
+        raise HTTPException(status_code=404, detail="GCS archive not found")
+    
+    gcs_url = job['gcs_url']
+    
+    # Forward the request to GCS with proper headers
+    headers = {
+        "Accept-Ranges": "bytes",
+        "Content-Type": "application/octet-stream",  # Use octet-stream like official examples
+        "Access-Control-Allow-Origin": "*",
+        "Access-Control-Allow-Methods": "GET, HEAD, OPTIONS",
+        "Access-Control-Allow-Headers": "*",
+        "Access-Control-Expose-Headers": "Accept-Ranges, Content-Length, Content-Range",
+        "Cross-Origin-Embedder-Policy": "require-corp",
+        "Cross-Origin-Opener-Policy": "same-origin"
+    }
+    
+    # Handle HEAD requests
+    if request.method == "HEAD":
+        async with aiohttp.ClientSession() as session:
+            async with session.head(gcs_url) as response:
+                headers["Content-Length"] = response.headers.get("Content-Length", "0")
+                return Response(headers=headers)
+    
+    # Handle range requests
+    range_header = request.headers.get("range")
+    request_headers = {}
+    if range_header:
+        request_headers["Range"] = range_header
+    
+    # Stream from GCS and let aiohttp handle the headers properly
+    async def stream_gcs():
+        async with aiohttp.ClientSession() as session:
+            async with session.get(gcs_url, headers=request_headers) as response:
+                # Forward the exact response headers from GCS
+                for header_name, header_value in response.headers.items():
+                    if header_name.lower() in ['content-length', 'content-range', 'content-type']:
+                        headers[header_name] = header_value
+                
+                # Override content-type to match replayweb.page expectations
+                headers["Content-Type"] = "application/octet-stream"
+                
+                # Stream the content
+                async for chunk in response.content.iter_chunked(8192):
+                    yield chunk
+    
+    status_code = 206 if range_header else 200
+    return StreamingResponse(stream_gcs(), status_code=status_code, headers=headers)
+
+@app.options("/api/gcs-proxy/{job_id}")
+async def gcs_proxy_options(job_id: str):
+    """Handle CORS preflight for GCS proxy"""
+    from fastapi.responses import Response
+    headers = {
+        "Access-Control-Allow-Origin": "*",
+        "Access-Control-Allow-Methods": "GET, HEAD, OPTIONS",
+        "Access-Control-Allow-Headers": "*",
+        "Access-Control-Max-Age": "86400"
+    }
+    return Response(headers=headers)
 
 @app.get("/health")
 async def health_check():

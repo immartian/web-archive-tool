@@ -1,266 +1,334 @@
-# Web Archive Tool - Cloud Run Edition
+# Web Archive Tool - Local Docker Edition
 
-A scalable web archiving solution designed for Google Cloud Run with persistent storage using Cloud Storage and Firestore.
+A dedicated web service for running Docker-based web archiving tools with a user-friendly web interface. This tool manages web archiving jobs using local Docker containers and provides persistent storage for archived content.
 
 ## 🚀 Features
 
-- ✅ **Cloud Native**: Designed for Google Cloud Run
-- ✅ **Persistent Storage**: Archives stored in Google Cloud Storage
-- ✅ **Scalable Jobs**: Job tracking with Firestore
+- ✅ **Local Docker Integration**: Runs browsertrix-crawler in Docker containers
+- ✅ **Persistent Local Storage**: Archives stored in local filesystem
+- ✅ **SQLite Database**: Lightweight job tracking and metadata storage
 - ✅ **Real-time Progress**: Server-sent events for live updates
-- ✅ **Auto-scaling**: Scales to zero when not in use
-- ✅ **Direct Downloads**: Public URLs for archived content
-- ✅ **Playback Integration**: Works with replayweb.page
+- ✅ **Web UI**: User-friendly interface for managing archives
+- ✅ **WACZ Format**: Compatible with replayweb.page for playback
+- ✅ **Multi-format Support**: JSON archives and WACZ files
 
 ## 📋 Prerequisites
 
-1. **Google Cloud Account** with billing enabled
-2. **gcloud CLI** installed and authenticated
-3. **Docker** installed locally (for local development)
-4. **Project with required APIs** enabled:
-   - Cloud Build API
-   - Cloud Run API
-   - Cloud Storage API
-   - Firestore API
+1. **Docker** installed and running
+2. **Python 3.11+** for local development
+3. **Docker permissions** for the application user
 
-## 🔧 Quick Deployment
+## 🔧 Quick Start
 
-### One-Click Deployment
+### Using Docker Compose (Recommended)
 
 ```bash
-# Make deployment script executable
-chmod +x deploy.sh
+# Clone the repository
+git clone https://github.com/immartian/web-archive-tool.git
+cd web-archive-tool
 
-# Deploy to Cloud Run
-./deploy.sh your-project-id us-central1
+# Run with Docker Compose
+docker-compose up -d
+
+# Access the web interface
+open http://localhost:8080
 ```
 
-### Manual Deployment
+### Manual Docker Setup
 
-1. **Set up Google Cloud Project**:
 ```bash
-# Set project
-gcloud config set project YOUR_PROJECT_ID
+# Build the Docker image
+docker build -t web-archive-tool .
 
-# Enable APIs
-gcloud services enable cloudbuild.googleapis.com
-gcloud services enable run.googleapis.com
-gcloud services enable storage.googleapis.com
-gcloud services enable firestore.googleapis.com
+# Run the container
+docker run -d \
+  -p 8080:8080 \
+  -v /var/run/docker.sock:/var/run/docker.sock \
+  -v $(pwd)/archives:/app/archives \
+  -v $(pwd)/data:/app/data \
+  --name web-archive-tool \
+  web-archive-tool
+
+# Access the web interface
+open http://localhost:8080
 ```
 
-2. **Create Cloud Storage Bucket**:
-```bash
-gsutil mb -p YOUR_PROJECT_ID -l us-central1 gs://web-archive-storage-YOUR_PROJECT_ID
-```
+### Local Development
 
-3. **Set up Firestore**:
 ```bash
-gcloud firestore databases create --location=us-central1 --type=firestore-native
-```
+# Install dependencies
+pip install -r requirements.txt
 
-4. **Deploy with Cloud Build**:
-```bash
-gcloud builds submit --config cloudbuild.yaml \
-  --substitutions _STORAGE_BUCKET=web-archive-storage-YOUR_PROJECT_ID
+# Set environment variables
+export ARCHIVE_DIR=./archives
+export DB_PATH=./archives.db
+
+# Run the application
+python main.py
 ```
 
 ## 🏗️ Architecture
 
 ```
 ┌─────────────────┐    ┌─────────────────┐    ┌─────────────────┐
-│   Cloud Run     │    │  Cloud Storage  │    │   Firestore     │
-│   (main app)    │────▶│   (archives)    │    │   (jobs)        │
+│   FastAPI App   │    │  Local Storage  │    │   SQLite DB     │
+│   (main.py)     │────▶│   (archives/)   │    │   (jobs)        │
 └─────────────────┘    └─────────────────┘    └─────────────────┘
          │
          ▼
 ┌─────────────────┐
+│ Docker Containers│
 │ browsertrix-    │
 │ crawler         │
-│ (temporary)     │
 └─────────────────┘
 ```
 
 ### Key Components
 
-- **Cloud Run Service**: Hosts the FastAPI application
-- **Cloud Storage**: Persistent storage for WACZ archives
-- **Firestore**: NoSQL database for job tracking and metadata
-- **Cloud Build**: Automated build and deployment pipeline
-- **browsertrix-crawler**: Temporary containers for web crawling
+- **FastAPI Application**: Web API and user interface
+- **Local Storage**: Persistent storage for WACZ and JSON archives
+- **SQLite Database**: Lightweight database for job tracking
+- **Docker Integration**: Runs browsertrix-crawler in containers
+- **Web Interface**: Real-time job monitoring and archive management
 
-## 🔐 Security & Permissions
+## 📁 Project Structure
 
-The Cloud Run service needs the following IAM roles:
-
-```bash
-# Service account with required permissions
-gcloud iam service-accounts create web-archive-sa
-
-# Grant necessary roles
-gcloud projects add-iam-policy-binding YOUR_PROJECT_ID \
-  --member="serviceAccount:web-archive-sa@YOUR_PROJECT_ID.iam.gserviceaccount.com" \
-  --role="roles/storage.objectAdmin"
-
-gcloud projects add-iam-policy-binding YOUR_PROJECT_ID \
-  --member="serviceAccount:web-archive-sa@YOUR_PROJECT_ID.iam.gserviceaccount.com" \
-  --role="roles/datastore.user"
+```
+web-archive-tool/
+├── main.py              # FastAPI application
+├── requirements.txt     # Python dependencies
+├── Dockerfile          # Container configuration
+├── docker-compose.yml  # Multi-container setup
+├── README.md           # This file
+├── archives/           # Archive storage directory
+│   ├── job-uuid-1/
+│   │   └── archive.wacz
+│   └── job-uuid-2/
+│       └── archive.json
+└── data/
+    └── archives.db     # SQLite database
 ```
 
-## 💰 Cost Optimization
-
-### Resource Configuration
-- **CPU**: 2 vCPU (adjustable in cloudbuild.yaml)
-- **Memory**: 2 GB (adjustable in cloudbuild.yaml)
-- **Timeout**: 1 hour (for long crawls)
-- **Concurrency**: 10 concurrent requests
-- **Max Instances**: 5 (auto-scales to zero)
-
-### Cost Estimates (per month)
-- **Cloud Run**: ~$0.10 per 100,000 requests
-- **Cloud Storage**: ~$0.026 per GB stored
-- **Firestore**: ~$0.18 per 100,000 reads
-- **Cloud Build**: ~$0.003 per build minute
-
-## 🛠️ Development
-
-### Local Development
-```bash
-# Install dependencies
-pip install -r requirements.txt
-
-# Set environment variables
-export GOOGLE_CLOUD_PROJECT=your-project-id
-export STORAGE_BUCKET=web-archive-storage-your-project-id
-
-# Run locally
-python main.py
-```
-
-### Testing
-```bash
-# Test with local Docker
-docker build -t web-archive .
-docker run -p 8080:8080 -e GOOGLE_CLOUD_PROJECT=your-project-id web-archive
-```
-
-## 📝 Configuration
+## 🛠️ Configuration
 
 ### Environment Variables
-- `GOOGLE_CLOUD_PROJECT`: Your GCP project ID
-- `STORAGE_BUCKET`: Cloud Storage bucket name
-- `PORT`: Server port (default: 8080)
 
-### Firestore Collections
-- `archive_jobs`: Job metadata and status
+- `ARCHIVE_DIR`: Directory for storing archives (default: `./archives`)
+- `DB_PATH`: SQLite database path (default: `./archives.db`)
+- `PORT`: Server port (default: `8080`)
 
-### Cloud Storage Structure
+### Docker Compose Configuration
+
+```yaml
+version: '3.8'
+services:
+  web-archive:
+    build: .
+    ports:
+      - "8080:8080"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./archives:/app/archives
+      - ./data:/app/data
+    environment:
+      - ARCHIVE_DIR=/app/archives
+      - DB_PATH=/app/data/archives.db
 ```
-gs://your-bucket/
-├── archives/
-│   ├── job-uuid-1/
-│   │   └── archive-job-uuid-1.wacz
-│   ├── job-uuid-2/
-│   │   └── archive-job-uuid-2.wacz
-│   └── ...
-```
 
-## 🔍 Monitoring
+## 🔍 Usage
 
-### Cloud Logging
+### Web Interface
+
+1. **Access the UI**: Open `http://localhost:8080` in your browser
+2. **Submit URL**: Enter a website URL to archive
+3. **Monitor Progress**: Watch real-time progress updates
+4. **Download Archives**: Access completed archives via download links
+5. **Playback**: Use replayweb.page integration for WACZ files
+
+### API Endpoints
+
+- `POST /api/archive` - Start new archive job
+- `GET /api/progress` - Server-sent events for progress updates
+- `GET /api/archives` - List completed archives
+- `GET /api/download/{job_id}/{filename}` - Download archive files
+- `POST /api/retry/{job_id}` - Retry failed jobs
+- `DELETE /api/delete/{job_id}` - Delete failed jobs
+
+## 🔧 Development
+
+### Local Development Setup
+
 ```bash
-# View logs
-gcloud logs tail /projects/YOUR_PROJECT_ID/logs/run.googleapis.com%2Fstdout
+# Install development dependencies
+pip install -r requirements.txt
 
-# Filter by service
-gcloud logs read "resource.type=cloud_run_revision AND resource.labels.service_name=web-archive"
+# Run in development mode
+python main.py
+
+# Run with auto-reload
+uvicorn main:app --reload --host 0.0.0.0 --port 8080
 ```
 
-### Cloud Monitoring
-- **Request Count**: Number of archive requests
-- **Response Time**: API response latency
-- **Error Rate**: Failed requests percentage
-- **Storage Usage**: Archive storage consumption
+### Adding New Archive Formats
+
+1. Create a new crawler function in `main.py`
+2. Register the crawler in the `analyze_url_for_crawler_type` function
+3. Update the storage manager to handle the new format
+4. Add frontend support for the new format
+
+## 🐳 Docker Integration
+
+The application uses Docker to run browsertrix-crawler instances:
+
+```python
+# Example: Running browsertrix-crawler in Docker
+docker_client.containers.run(
+    "webrecorder/browsertrix-crawler",
+    command=["crawl", "--url", url, "--output", "/crawls"],
+    volumes={"/tmp/crawls": {"bind": "/crawls", "mode": "rw"}},
+    remove=True
+)
+```
+
+## 📊 Storage Management
+
+### Local Storage Structure
+
+```
+archives/
+├── job-uuid-1/
+│   ├── archive-job-uuid-1.wacz
+│   └── metadata.json
+├── job-uuid-2/
+│   ├── archive-job-uuid-2.json
+│   └── metadata.json
+└── ...
+```
+
+### Database Schema
+
+```sql
+CREATE TABLE archive_jobs (
+    job_id TEXT PRIMARY KEY,
+    url TEXT NOT NULL,
+    status TEXT NOT NULL,
+    progress INTEGER DEFAULT 0,
+    created_at TEXT NOT NULL,
+    completed_at TEXT,
+    archive_path TEXT,
+    local_path TEXT,
+    crawler_type TEXT,
+    crawler_reason TEXT,
+    complexity_score INTEGER DEFAULT 0
+);
+```
+
+## 🔒 Security Considerations
+
+- Docker socket access is required for container management
+- Archive files are stored locally without external access
+- No sensitive data is logged or exposed
+- User input is validated and sanitized
 
 ## 🚨 Troubleshooting
 
 ### Common Issues
 
-1. **Permission Errors**:
+1. **Docker Permission Errors**:
+   ```bash
+   # Add user to docker group
+   sudo usermod -a -G docker $USER
+   # Restart session
+   ```
+
+2. **Storage Permission Issues**:
+   ```bash
+   # Fix archive directory permissions
+   chmod 755 ./archives
+   chown -R $USER:$USER ./archives
+   ```
+
+3. **Database Lock Issues**:
+   ```bash
+   # Remove database lock
+   rm -f ./data/archives.db-wal ./data/archives.db-shm
+   ```
+
+### Logs and Debugging
+
 ```bash
-# Check service account permissions
-gcloud iam service-accounts get-iam-policy web-archive-sa@YOUR_PROJECT_ID.iam.gserviceaccount.com
+# View application logs
+docker logs web-archive-tool
+
+# Debug mode
+export DEBUG=1
+python main.py
+
+# Check Docker connectivity
+docker ps
+docker info
 ```
 
-2. **Storage Access Issues**:
-```bash
-# Test bucket access
-gsutil ls gs://web-archive-storage-YOUR_PROJECT_ID
-```
+## 📈 Performance Tuning
 
-3. **Firestore Connection Issues**:
-```bash
-# Check Firestore status
-gcloud firestore databases describe --database="(default)"
-```
-
-### Performance Tuning
-
-1. **Increase Memory**: For large sites
-2. **Adjust Timeout**: For long crawls
-3. **Scale Instances**: For high traffic
-4. **Optimize Crawl Settings**: Limit pages/depth
-
-## 📊 Usage Analytics
-
-Track usage with Cloud Monitoring:
-- Archive requests per day
-- Storage growth over time
-- Popular domains archived
-- Error rates by URL type
-
-## 🔄 Updates & Maintenance
-
-### Automated Deployments
-Set up Cloud Build triggers for automatic deployments:
+### Resource Limits
 
 ```yaml
-# cloudbuild-trigger.yaml
-name: web-archive-deploy
-github:
-  owner: your-username
-  name: your-repo
-  push:
-    branch: main
-filename: cloudbuild.yaml
+# docker-compose.yml
+services:
+  web-archive:
+    deploy:
+      resources:
+        limits:
+          cpus: '2.0'
+          memory: 4G
+        reservations:
+          cpus: '1.0'
+          memory: 2G
 ```
 
-### Database Maintenance
-- Monitor Firestore usage
-- Clean up old job records
-- Archive completed jobs
+### Concurrent Jobs
 
-## 🌐 Custom Domain
+The application supports multiple concurrent archiving jobs with automatic resource management.
+
+## 🔄 Backup and Recovery
+
+### Database Backup
 
 ```bash
-# Map custom domain
-gcloud run domain-mappings create \
-  --service=web-archive \
-  --domain=archive.yourdomain.com \
-  --region=us-central1
+# Backup SQLite database
+cp ./data/archives.db ./data/archives.db.backup
+
+# Restore from backup
+cp ./data/archives.db.backup ./data/archives.db
+```
+
+### Archive Backup
+
+```bash
+# Backup all archives
+tar -czf archives-backup.tar.gz ./archives/
+
+# Restore archives
+tar -xzf archives-backup.tar.gz
 ```
 
 ## 📞 Support
 
 For issues and questions:
-1. Check Cloud Run logs
-2. Review Firestore collections
-3. Verify IAM permissions
-4. Test bucket access
+1. Check application logs for errors
+2. Verify Docker daemon is running
+3. Check file permissions for storage directories
+4. Review SQLite database status
 
 ## 🔗 Related Resources
 
-- [Cloud Run Documentation](https://cloud.google.com/run/docs)
-- [Cloud Storage Documentation](https://cloud.google.com/storage/docs)
-- [Firestore Documentation](https://cloud.google.com/firestore/docs)
+- [FastAPI Documentation](https://fastapi.tiangolo.com/)
+- [Docker Documentation](https://docs.docker.com/)
 - [browsertrix-crawler](https://github.com/webrecorder/browsertrix-crawler)
+- [replayweb.page](https://replayweb.page/)
+- [SQLite Documentation](https://sqlite.org/docs.html)
+
+## 📄 License
+
+This project is open source and available under the MIT License.

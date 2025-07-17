@@ -1,0 +1,6 @@
+venv/
+sage-striker-294302-b89a8b7e205b.json
+.env
+*.log
+*.pid
+data/
