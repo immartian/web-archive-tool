@@ -1,24 +1,23 @@
 # Web Archive Tool - Local Docker Edition
 
 A dedicated web service for running Docker-based web archiving tools with a user-friendly web interface. This tool manages web archiving jobs using local Docker containers and provides persistent storage for archived content.
+## Features
 
-## 🚀 Features
-
-- ✅ **Local Docker Integration**: Runs browsertrix-crawler in Docker containers
-- ✅ **Persistent Local Storage**: Archives stored in local filesystem
-- ✅ **SQLite Database**: Lightweight job tracking and metadata storage
-- ✅ **Real-time Progress**: Server-sent events for live updates
-- ✅ **Web UI**: User-friendly interface for managing archives
-- ✅ **WACZ Format**: Compatible with replayweb.page for playback
-- ✅ **Multi-format Support**: JSON archives and WACZ files
-
-## 📋 Prerequisites
+- **Local Docker Integration**: Runs browsertrix-crawler in Docker containers
+- **Persistent Local Storage**: Archives stored in local filesystem
+- **SQLite Database**: Lightweight job tracking and metadata storage
+- **Real-time Progress**: Server-sent events for live updates
+- **Web UI**: User-friendly interface for managing archives
+- **WACZ Format**: Compatible with replayweb.page for playback
+- **Multi-format Support**: JSON archives and WACZ files
+ 
+## Prerequisites
 
 1. **Docker** installed and running
 2. **Python 3.11+** for local development
 3. **Docker permissions** for the application user
 
-## 🔧 Quick Start
+## Quick Start
 
 ### Using Docker Compose (Recommended)
 
@@ -67,13 +66,13 @@ export DB_PATH=./archives.db
 python main.py
 ```
 
-## 🏗️ Architecture
+## Architecture
 
 ```
-┌─────────────────┐    ┌─────────────────┐    ┌─────────────────┐
-│   FastAPI App   │    │  Local Storage  │    │   SQLite DB     │
-│   (main.py)     │────▶│   (archives/)   │    │   (jobs)        │
-└─────────────────┘    └─────────────────┘    └─────────────────┘
+┌─────────────────┐    ┌─────────────────┐    ┌─────────────────┐    ┌─────────────────────────┐
+│   FastAPI App   │    │  Local Storage  │    │   SQLite DB     │    │ Google Cloud Storage    │
+│   (main.py)     │────▶│   (archives/)   │    │   (jobs)        │    │   (GCS, WACZ files)     │
+└─────────────────┘    └─────────────────┘    └─────────────────┘    └─────────────────────────┘
          │
          ▼
 ┌─────────────────┐
@@ -91,7 +90,7 @@ python main.py
 - **Docker Integration**: Runs browsertrix-crawler in containers
 - **Web Interface**: Real-time job monitoring and archive management
 
-## 📁 Project Structure
+## Project Structure
 
 ```
 web-archive-tool/
@@ -109,7 +108,7 @@ web-archive-tool/
     └── archives.db     # SQLite database
 ```
 
-## 🛠️ Configuration
+## Configuration
 
 ### Environment Variables
 
@@ -135,7 +134,7 @@ services:
       - DB_PATH=/app/data/archives.db
 ```
 
-## 🔍 Usage
+## Usage
 
 ### Web Interface
 
@@ -154,7 +153,7 @@ services:
 - `POST /api/retry/{job_id}` - Retry failed jobs
 - `DELETE /api/delete/{job_id}` - Delete failed jobs
 
-## 🔧 Development
+## Development
 
 ### Local Development Setup
 
@@ -176,7 +175,7 @@ uvicorn main:app --reload --host 0.0.0.0 --port 8080
 3. Update the storage manager to handle the new format
 4. Add frontend support for the new format
 
-## 🐳 Docker Integration
+## Docker Integration
 
 The application uses Docker to run browsertrix-crawler instances:
 
@@ -190,7 +189,7 @@ docker_client.containers.run(
 )
 ```
 
-## 📊 Storage Management
+## Storage Management
 
 ### Local Storage Structure
 
@@ -223,14 +222,14 @@ CREATE TABLE archive_jobs (
 );
 ```
 
-## 🔒 Security Considerations
+## Security Considerations
 
 - Docker socket access is required for container management
 - Archive files are stored locally without external access
 - No sensitive data is logged or exposed
 - User input is validated and sanitized
 
-## 🚨 Troubleshooting
+## Troubleshooting
 
 ### Common Issues
 
@@ -269,7 +268,7 @@ docker ps
 docker info
 ```
 
-## 📈 Performance Tuning
+## Performance Tuning
 
 ### Resource Limits
 
@@ -291,7 +290,7 @@ services:
 
 The application supports multiple concurrent archiving jobs with automatic resource management.
 
-## 🔄 Backup and Recovery
+## Backup and Recovery
 
 ### Database Backup
 
@@ -313,7 +312,7 @@ tar -czf archives-backup.tar.gz ./archives/
 tar -xzf archives-backup.tar.gz
 ```
 
-## 📞 Support
+## Support
 
 For issues and questions:
 1. Check application logs for errors
@@ -321,7 +320,7 @@ For issues and questions:
 3. Check file permissions for storage directories
 4. Review SQLite database status
 
-## 🔗 Related Resources
+## Related Resources
 
 - [FastAPI Documentation](https://fastapi.tiangolo.com/)
 - [Docker Documentation](https://docs.docker.com/)
@@ -329,6 +328,6 @@ For issues and questions:
 - [replayweb.page](https://replayweb.page/)
 - [SQLite Documentation](https://sqlite.org/docs.html)
 
-## 📄 License
+## License
 
 This project is open source and available under the MIT License.

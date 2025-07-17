@@ -1,19 +1,10 @@
 #!/bin/bash
 
-# Web Archive Tool - Docker Management Script
+# Web Archive Tool - Local Development Script
 
 # Function to stop the service
 stop_service() {
     echo "🛑 Stopping Web Archive Tool..."
-    
-    # Stop docker-compose deployment
-    echo "Stopping docker-compose..."
-    docker-compose down 2>/dev/null || true
-    
-    # Stop standalone container
-    echo "Stopping standalone container..."
-    docker stop web-archive-tool 2>/dev/null || true
-    docker rm web-archive-tool 2>/dev/null || true
     
     # Stop Python server
     echo "Stopping Python server..."
@@ -26,8 +17,9 @@ stop_service() {
         rm -f server.pid
     fi
     
-    # Kill any remaining Python processes
+    # Kill any remaining Python/uvicorn processes
     pkill -f "python.*main.py" 2>/dev/null || true
+    pkill -f "uvicorn.*main:app" 2>/dev/null || true
     
     # Check if anything is still running on port 8080
     if lsof -i :8080 > /dev/null 2>&1; then
@@ -64,12 +56,10 @@ start_service() {
 
     # Stop any existing instances
     echo "🛑 Stopping previous instances..."
-    docker-compose down 2>/dev/null || true
-    docker stop web-archive-tool 2>/dev/null || true
-    docker rm web-archive-tool 2>/dev/null || true
     
-    # Stop any existing Python processes on port 8080
+    # Stop any existing Python/uvicorn processes on port 8080
     pkill -f "python.*main.py" 2>/dev/null || true
+    pkill -f "uvicorn.*main:app" 2>/dev/null || true
 
     # Pull the latest browsertrix-crawler image
     echo "📦 Pulling browsertrix-crawler image..."
@@ -102,9 +92,9 @@ start_service() {
     export DB_PATH="$(pwd)/data/archives.db"
     export PORT=8080
 
-    # Start the FastAPI server
-    echo "🚀 Starting FastAPI server on host..."
-    nohup python main.py > server.log 2>&1 &
+    # Start the FastAPI server with uvicorn
+    echo "🚀 Starting FastAPI server with uvicorn..."
+    nohup uvicorn main:app --host 0.0.0.0 --port 8080 --reload > server.log 2>&1 &
     SERVER_PID=$!
     
     # Wait a moment for server to start
@@ -125,10 +115,12 @@ start_service() {
     echo ""
     echo "🌐 Access the web interface at: http://localhost:8080"
     echo "📋 The tool now supports:"
-    echo "   • Deep crawling (3 levels, up to 50 pages)"
-    echo "   • Professional WACZ archives via Docker"
-    echo "   • replayweb.page integration"
-    echo "   • Real-time progress monitoring"
+    echo "   • Deep crawling (4 levels, up to 100 pages)"
+    echo "   • Professional WACZ archives via browsertrix-crawler"
+    echo "   • Async non-blocking crawling with real-time progress"
+    echo "   • Cloud storage integration (Google Cloud Storage)"
+    echo "   • replayweb.page integration for online playback"
+    echo "   • Unified job management with stop/retry/delete controls"
 }
 
 # Main script logic
