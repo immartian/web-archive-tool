@@ -789,7 +789,7 @@ def analyze_url_for_crawler_type(url: str) -> dict:
         "domain": parsed.netloc.lower(),
         "path": parsed.path.lower(),
         "recommended_crawler": "browsertrix",
-        "reason": "Professional web archiving with browsertrix-crawler",
+        "reason": "High-quality web archiving",
         "complexity_score": 1
     }
     
@@ -1161,14 +1161,14 @@ async def run_browsertrix_crawler(job_id: str, url: str):
                 raise Exception(f"Failed to start container: {e}")
             
             # Update status to show container is running
-            await job_manager.update_job(job_id, {"status": "crawling", "progress": 35})
+            await job_manager.update_job(job_id, {"status": "crawling", "progress": 10})
             
             # Don't block the main thread - let the container run and monitor progress separately
             # The container will run independently and we'll check its status periodically
             
             # Start a background task to monitor progress without blocking
             async def monitor_container_progress():
-                progress = 35
+                progress = 10
                 pages_archived = 0
                 current_depth = 1
                 container_id = container.id
@@ -1226,7 +1226,7 @@ async def run_browsertrix_crawler(job_id: str, url: str):
                             if recent_pages > 0:
                                 # This is a rough estimate - we're counting recent pages
                                 pages_archived = max(pages_archived, recent_pages)
-                                progress = min(35 + int(pages_archived * 0.5), 85)
+                                progress = min(10 + int(pages_archived * 2), 80)
                                 
                                 await job_manager.update_job(job_id, {
                                     "progress": progress, 
@@ -1266,7 +1266,7 @@ async def run_browsertrix_crawler(job_id: str, url: str):
                         await job_manager.update_job(job_id, {"status": "failed", "progress": 0})
                         return
                     
-                    await job_manager.update_job(job_id, {"progress": 90})
+                    await job_manager.update_job(job_id, {"progress": 95})
                     
                     # Find the generated WACZ file
                     wacz_files = []
