@@ -37,6 +37,50 @@ ARCHIVE_DIR = os.getenv("ARCHIVE_DIR", "./archives")
 DB_PATH = os.getenv("DB_PATH", "./data/archives.db")
 PORT = int(os.getenv("PORT", 8080))
 
+def cleanup_orphaned_containers():
+    """Clean up any browsertrix containers that may be running from previous sessions"""
+    if not docker_client:
+        return
+        
+    try:
+        # Find all running browsertrix containers
+        containers = docker_client.containers.list(
+            filters={"ancestor": "webrecorder/browsertrix-crawler:latest"}
+        )
+        
+        for container in containers:
+            try:
+                # Stop and remove the container
+                container.stop(timeout=10)
+                container.remove()
+            except Exception as e:
+                # Container might already be stopped/removed
+                pass
+                
+    except Exception as e:
+        pass
+
+async def cleanup_orphaned_jobs():
+    """Update job status for jobs that were running when the app restarted"""
+    try:
+        # Initialize a temporary job manager to update orphaned jobs
+        temp_job_manager = SQLiteJobManager(DB_PATH)
+        
+        # Find all jobs that were in active states
+        all_jobs = await temp_job_manager.get_all_jobs()
+        active_statuses = ["started", "crawling", "preparing", "uploading_gcs"]
+        
+        for job in all_jobs:
+            if job.get("status") in active_statuses:
+                # Mark as stopped since containers were cleaned up
+                await temp_job_manager.update_job(job["job_id"], {
+                    "status": "stopped",
+                    "completed_at": datetime.now().isoformat()
+                })
+                
+    except Exception as e:
+        pass
+
 # Initialize Docker client
 docker_client = None
 try:
@@ -44,10 +88,15 @@ try:
     docker_client = docker.DockerClient(base_url='unix:///var/run/docker.sock')
     # Test the connection
     docker_client.ping()
-    print("✅ Docker client initialized successfully")
+    
+    # Clean up any orphaned browsertrix containers on startup - but only if they've been running for a very long time
+    # cleanup_orphaned_containers()  # Disabled for now - too aggressive
+    
+    # Update any jobs that were running when the app restarted
+    # asyncio.run(cleanup_orphaned_jobs())  # Disabled for now
+    
 except Exception as e:
-    print(f"❌ Docker client initialization failed: {e}")
-    print("   Make sure Docker is running and accessible")
+    pass
     docker_client = None
 
 # Ensure archive directory exists
@@ -91,6 +140,13 @@ def init_db():
     # Add pages_archived column if it doesn't exist (for existing databases)
     try:
         cursor.execute('ALTER TABLE archive_jobs ADD COLUMN pages_archived INTEGER DEFAULT 0')
+    except sqlite3.OperationalError:
+        # Column already exists
+        pass
+    
+    # Add current_depth column if it doesn't exist (for existing databases)
+    try:
+        cursor.execute('ALTER TABLE archive_jobs ADD COLUMN current_depth INTEGER DEFAULT 1')
     except sqlite3.OperationalError:
         # Column already exists
         pass
@@ -278,6 +334,10 @@ async def get_frontend():
             }
             .error { color: red; }
             .success { color: green; }
+            .status-stopped { color: #ff9500; font-weight: bold; }
+            .status-failed { color: #dc3545; font-weight: bold; }
+            .status-completed { color: #28a745; font-weight: bold; }
+            .status-active { color: #007bff; font-weight: bold; }
             .cloud-badge { 
                 background: #4285f4; 
                 color: white; 
@@ -307,13 +367,8 @@ async def get_frontend():
         </div>
 
         <div class="container">
-            <h2>Active Jobs</h2>
-            <div id="activeJobs"></div>
-        </div>
-
-        <div class="container">
-            <h2>Completed Archives</h2>
-            <div id="completedArchives"></div>
+            <h2>Jobs</h2>
+            <div id="allJobs"></div>
         </div>
 
         <script>
@@ -324,11 +379,17 @@ async def get_frontend():
                 const messageDiv = document.getElementById('message');
                 messageDiv.innerHTML = `<div class="${type}">${text}</div>`;
                 
-                // Auto-hide only brief success messages, keep important info/error messages
-                if (type === 'success' && !text.includes('What happens next:')) {
-                    setTimeout(() => messageDiv.innerHTML = '', 5000);
+                // Auto-hide success messages after different timeouts
+                if (type === 'success') {
+                    if (text.includes('What happens next:')) {
+                        // Hide detailed GCS upload message after 15 seconds
+                        setTimeout(() => messageDiv.innerHTML = '', 15000);
+                    } else {
+                        // Hide brief success messages after 5 seconds
+                        setTimeout(() => messageDiv.innerHTML = '', 5000);
+                    }
                 }
-                // Keep error messages and detailed info messages visible
+                // Keep error messages visible (no auto-hide for errors)
             }
 
             async function startArchive() {
@@ -385,7 +446,6 @@ async def get_frontend():
                 };
 
                 eventSource.onerror = function() {
-                    console.error('EventSource error');
                     setTimeout(startProgressMonitoring, 5000);
                 };
             }
@@ -399,20 +459,26 @@ async def get_frontend():
                     }
                 });
                 
-                const activeDiv = document.getElementById('activeJobs');
-                const completedDiv = document.getElementById('completedArchives');
+                const allJobsDiv = document.getElementById('allJobs');
+                allJobsDiv.innerHTML = '';
                 
-                activeDiv.innerHTML = '';
-                completedDiv.innerHTML = '';
-                
-                Object.values(jobs).forEach(job => {
-                    const jobHTML = createJobHTML(job);
-                    if (job.status === 'completed') {
-                        completedDiv.innerHTML += jobHTML;
-                    } else {
-                        activeDiv.innerHTML += jobHTML;
-                    }
+                // Sort jobs by created_at (newest first)
+                const sortedJobs = Object.values(jobs).sort((a, b) => {
+                    return new Date(b.created_at) - new Date(a.created_at);
                 });
+                
+                sortedJobs.forEach(job => {
+                    const jobHTML = createJobHTML(job);
+                    allJobsDiv.innerHTML += jobHTML;
+                });
+                // Job list updated
+            }
+
+            function getStatusClass(status) {
+                if (status === 'completed') return 'completed';
+                if (status === 'failed') return 'failed';
+                if (status === 'stopped') return 'stopped';
+                return 'active';
             }
 
             function createJobHTML(job) {
@@ -423,14 +489,10 @@ async def get_frontend():
                 
                 const progressWidth = job.progress || 0;
                 
-                // Determine play button behavior based on GCS URL availability
+                // Only show play button when GCS URL is available
                 let playbackButton = '';
-                if (job.status === 'completed' && job.local_path) {
-                    if (job.gcs_url) {
-                        playbackButton = `<button class="playback-btn" onclick="playArchiveGCS('${job.gcs_url}')">📺 Play Online</button>`;
-                    } else {
-                        playbackButton = `<button class="playback-btn" onclick="playArchive('${job.local_path}')">📺 Play Local</button>`;
-                    }
+                if (job.status === 'completed' && job.gcs_url) {
+                    playbackButton = `<button class="playback-btn" onclick="playArchiveGCS('${job.gcs_url}')">📺 Play Online</button>`;
                 }
                 
                 const downloadButton = job.status === 'completed' && job.local_path ? 
@@ -457,9 +519,16 @@ async def get_frontend():
                     gcsStatus = `<div><strong>Cloud:</strong> ❌ Upload failed - ${errorMsg}</div>`;
                 }
                 
-                const retryButton = job.status === 'failed' ? 
-                    `<button class="retry-btn" onclick="retryJob('${job.job_id}')">🔄 Retry</button>` : '';
-                const deleteButton = (job.status === 'failed' || job.status === 'completed') ? 
+                // Action buttons based on job status
+                let actionButtons = '';
+                if (job.status === 'failed') {
+                    actionButtons = `<button class="retry-btn" onclick="retryJob('${job.job_id}')">🔄 Retry</button>`;
+                } else if (['started', 'crawling', 'preparing', 'uploading_gcs'].includes(job.status)) {
+                    actionButtons = `<button class="delete-btn" onclick="stopJob('${job.job_id}')">⏹️ Stop</button>`;
+                }
+                
+                // Delete button for non-active jobs
+                const deleteButton = ['failed', 'completed', 'gcs_upload_failed', 'stopped'].includes(job.status) ? 
                     `<button class="delete-btn" onclick="deleteArchive('${job.job_id}')">🗑️ Delete</button>` : '';
                 
                 const startedDate = job.created_at ? new Date(job.created_at).toLocaleString() : 'Unknown';
@@ -475,19 +544,25 @@ async def get_frontend():
                 // Create clickable URL
                 const clickableUrl = `<a href="${job.url}" target="_blank" rel="noopener noreferrer" style="color: #007bff; text-decoration: none;">${job.url}</a>`;
                 
-                // Add page count information
-                const pageInfo = job.pages_archived > 0 ? 
-                    `<div><strong>Pages Archived:</strong> ${job.pages_archived}</div>` : '';
+                // Add page count and depth information
+                let crawlInfo = '';
+                if (job.pages_archived > 0 || job.current_depth > 0) {
+                    const pages = job.pages_archived || 0;
+                    const depth = job.current_depth || 1;
+                    const maxDepth = 4; // Our configured max depth
+                    
+                    crawlInfo = `<div><strong>Crawling:</strong> ${pages} pages • Level ${depth}/${maxDepth}</div>`;
+                }
 
                 return `
                     <div class="job">
                         <div><strong>URL:</strong> ${clickableUrl} ${crawlerBadge}</div>
-                        <div class="status"><strong>Status:</strong> ${job.status}</div>
+                        <div class="status"><strong>Status:</strong> <span class="status-${getStatusClass(job.status)}">${job.status}</span></div>
                         <div class="progress">
                             <div class="progress-bar" style="width: ${progressWidth}%"></div>
                         </div>
                         <div>Progress: ${progressWidth}%</div>
-                        ${pageInfo}
+                        ${crawlInfo}
                         <div><strong>Started:</strong> ${startedDate}</div>
                         ${completedDate ? `<div><strong>Completed:</strong> ${completedDate}</div>` : ''}
                         ${job.local_path ? `<div><strong>Storage:</strong> Local Storage</div>` : ''}
@@ -496,7 +571,7 @@ async def get_frontend():
                         ${playbackButton}
                         ${gcsUploadButton}
                         ${downloadButton}
-                        ${retryButton}
+                        ${actionButtons}
                         ${deleteButton}
                     </div>
                 `;
@@ -562,6 +637,31 @@ async def get_frontend():
                     showMessage(`Archive retry started! Job ID: ${result.job_id}`, 'success');
                 } catch (error) {
                     showMessage(`Retry error: ${error.message}`, 'error');
+                }
+            }
+
+            async function stopJob(jobId) {
+                if (!confirm('Are you sure you want to stop this job?')) {
+                    return;
+                }
+                
+                try {
+                    const response = await fetch(`/api/stop/${jobId}`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' }
+                    });
+
+                    if (!response.ok) {
+                        throw new Error('Failed to stop job');
+                    }
+
+                    showMessage('Job stopped successfully', 'success');
+                    // Remove from local jobs object
+                    delete jobs[jobId];
+                    // Refresh display
+                    updateJobList(Object.values(jobs));
+                } catch (error) {
+                    showMessage(`Stop error: ${error.message}`, 'error');
                 }
             }
 
@@ -631,20 +731,7 @@ async def get_frontend():
                     }
 
                     const result = await response.json();
-                    showMessage(`
-                        <div style="text-align: left; max-width: 600px; margin: 0 auto;">
-                            <p><strong>✅ Cloud upload started!</strong></p>
-                            <p>Your archive is being uploaded to Google Cloud Storage.</p>
-                            <p><strong>What happens next:</strong></p>
-                            <ul style="margin: 10px 0;">
-                                <li>📤 Archive will be uploaded to cloud storage (may take a few minutes)</li>
-                                <li>🔄 This page will automatically refresh to show upload progress</li>
-                                <li>📺 Once complete, you'll see a "Play Online" button that opens directly in replayweb.page</li>
-                                <li>🌐 The archive will be accessible from anywhere with the online link</li>
-                            </ul>
-                            <p style="color: #666; font-size: 12px;">Note: Large archives may take several minutes to upload.</p>
-                        </div>
-                    `, 'success');
+                    showMessage('☁️ Uploading to cloud storage...', 'success');
                 } catch (error) {
                     showMessage(`Upload error: ${error.message}`, 'error');
                 }
@@ -678,13 +765,13 @@ async def get_frontend():
 
             async function loadExistingArchives() {
                 try {
-                    const response = await fetch('/api/archives');
+                    const response = await fetch('/api/jobs');
                     if (response.ok) {
-                        const archives = await response.json();
-                        updateJobList(archives);
+                        const jobs = await response.json();
+                        updateJobList(jobs);
                     }
                 } catch (error) {
-                    console.error('Failed to load existing archives:', error);
+                    // Failed to load existing jobs
                 }
             }
         </script>
@@ -734,10 +821,15 @@ async def create_archive(request: ArchiveRequest, background_tasks: BackgroundTa
         "local_path": None,
         "crawler_type": "browsertrix",
         "crawler_reason": analysis["reason"],
-        "complexity_score": analysis["complexity_score"]
+        "complexity_score": analysis["complexity_score"],
+        "pages_archived": 0,
+        "current_depth": 1
     }
     
     await job_manager.create_job(job_data)
+    
+    # Give the EventSource a moment to catch the "started" status
+    await asyncio.sleep(0.5)
     
     # Always use browsertrix-crawler
     background_tasks.add_task(run_browsertrix_crawler, job_id, url)
@@ -781,6 +873,27 @@ async def retry_archive(job_id: str, background_tasks: BackgroundTasks):
     
     return {"job_id": job_id, "status": "restarted"}
 
+@app.post("/api/stop/{job_id}")
+async def stop_job(job_id: str):
+    """Stop an active job"""
+    
+    # Get the job to check if it exists
+    existing_job = await job_manager.get_job(job_id)
+    if not existing_job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    
+    # Only allow stopping of active jobs
+    if existing_job["status"] not in ["started", "crawling", "preparing", "uploading_gcs"]:
+        raise HTTPException(status_code=400, detail="Only active jobs can be stopped")
+    
+    # Update job status to stopped
+    await job_manager.update_job(job_id, {
+        "status": "stopped",
+        "completed_at": datetime.now().isoformat()
+    })
+    
+    return {"message": "Job stopped successfully", "job_id": job_id}
+
 @app.delete("/api/delete/{job_id}")
 async def delete_job(job_id: str):
     
@@ -807,9 +920,9 @@ async def delete_archive(job_id: str):
     if not existing_job:
         raise HTTPException(status_code=404, detail="Job not found")
     
-    # Only allow deletion of completed or failed jobs for safety
-    if existing_job["status"] not in ["completed", "failed", "gcs_upload_failed"]:
-        raise HTTPException(status_code=400, detail="Only completed or failed jobs can be deleted")
+    # Only allow deletion of completed, failed, or stopped jobs for safety
+    if existing_job["status"] not in ["completed", "failed", "gcs_upload_failed", "stopped"]:
+        raise HTTPException(status_code=400, detail="Only completed, failed, or stopped jobs can be deleted")
     
     results = {
         "database": False,
@@ -822,13 +935,23 @@ async def delete_archive(job_id: str):
     if existing_job.get("local_path"):
         try:
             import os
-            if os.path.exists(existing_job["local_path"]):
-                os.remove(existing_job["local_path"])
+            import shutil
+            
+            # Build full path to the file
+            full_file_path = os.path.join("archives", existing_job["local_path"])
+            
+            # Get the job directory (parent directory of the file)
+            job_directory = os.path.dirname(full_file_path)
+            
+            if os.path.exists(job_directory):
+                # Remove the entire job directory and all its contents
+                shutil.rmtree(job_directory)
                 results["local_file"] = True
+                pass
             else:
-                results["local_file"] = True  # File doesn't exist, consider it deleted
+                results["local_file"] = True  # Directory doesn't exist, consider it deleted
         except Exception as e:
-            results["errors"].append(f"Failed to delete local file: {str(e)}")
+            results["errors"].append(f"Failed to delete local directory: {str(e)}")
     
     # 2. Delete from Google Cloud Storage
     if existing_job.get("gcs_url"):
@@ -928,13 +1051,17 @@ async def get_progress():
             # Filter out invalid jobs and send the complete job list
             valid_jobs = [job for job in jobs if job and job.get('job_id') and job.get('url') and job.get('status')]
             yield f"data: {json.dumps({'jobs': valid_jobs})}\n\n"
-            await asyncio.sleep(2)
+            await asyncio.sleep(1)
     
     return StreamingResponse(event_stream(), media_type="text/event-stream")
 
 @app.get("/api/archives")
 async def get_archives():
     return await job_manager.get_completed_jobs()
+
+@app.get("/api/jobs")
+async def get_all_jobs():
+    return await job_manager.get_all_jobs()
 
 @app.get("/api/playback/{job_id}")
 async def playback_archive(job_id: str):
@@ -956,14 +1083,14 @@ async def run_browsertrix_crawler(job_id: str, url: str):
     try:
         await job_manager.update_job(job_id, {"status": "crawling", "progress": 10})
         
-        print(f"Starting browsertrix-crawler for {url} (job {job_id})")
+        pass
         
         if not docker_client:
             raise Exception("Docker client not available")
         
         # Create temporary directory for crawler output
         temp_dir = tempfile.mkdtemp(prefix=f"crawl_{job_id}_")
-        print(f"Created temp directory: {temp_dir}")
+        pass
         
         try:
             await job_manager.update_job(job_id, {"progress": 20})
@@ -972,16 +1099,17 @@ async def run_browsertrix_crawler(job_id: str, url: str):
             crawler_config = {
                 "url": url,
                 "collection": f"archive-{job_id}",
-                "depth": 3,
-                "limit": 50,
-                "timeout": 600,
+                "depth": 4,  # Increased depth for more comprehensive crawling
+                "limit": 100,  # Increased page limit
+                "timeout": 900,  # Increased timeout to 15 minutes
                 "workers": 2,
                 "screenshot": "view",
                 "screencastTimeout": 10,
                 "behaviors": "autoscroll,autoplay,autofetch,siteSpecific",
                 "userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-                "scopeType": "prefix",
+                "scopeType": "prefix", 
                 "include": "same-domain"
+                # Removed extraHops to focus on the target domain only
             }
             
             # Build crawler command
@@ -1004,112 +1132,194 @@ async def run_browsertrix_crawler(job_id: str, url: str):
                 "--logging", "info"
             ]
             
-            print(f"Running browsertrix-crawler with command: {' '.join(crawler_cmd)}")
+            pass
             
-            await job_manager.update_job(job_id, {"progress": 30})
+            await job_manager.update_job(job_id, {"status": "preparing", "progress": 30})
             
-            # Run browsertrix-crawler in Docker
-            container = docker_client.containers.run(
-                "webrecorder/browsertrix-crawler:latest",
-                command=crawler_cmd,
-                volumes={
-                    temp_dir: {"bind": "/crawls", "mode": "rw"}
-                },
-                environment={
-                    "CRAWL_ID": job_id,
-                    "STORE_USER": "1000",
-                    "STORE_GROUP": "1000"
-                },
-                remove=True,
-                detach=True,
-                stdout=True,
-                stderr=True,
-                user="1000:1000"
-            )
+            # Run browsertrix-crawler in Docker with error handling
+            try:
+                container = docker_client.containers.run(
+                    "webrecorder/browsertrix-crawler:latest",
+                    command=crawler_cmd,
+                    volumes={
+                        temp_dir: {"bind": "/crawls", "mode": "rw"}
+                    },
+                    environment={
+                        "CRAWL_ID": job_id,
+                        "STORE_USER": "1000",
+                        "STORE_GROUP": "1000"
+                    },
+                    remove=False,  # Don't remove so we can debug
+                    detach=True,
+                    stdout=True,
+                    stderr=True,
+                    user="1000:1000"
+                )
+            except Exception as e:
+                # Container creation failed
+                await job_manager.update_job(job_id, {"status": "failed", "progress": 0})
+                raise Exception(f"Failed to start container: {e}")
             
-            print(f"Container started: {container.id}")
+            # Update status to show container is running
+            await job_manager.update_job(job_id, {"status": "crawling", "progress": 35})
             
-            # Monitor container progress
-            progress = 30
-            pages_archived = 0
-            for log_line in container.logs(stream=True, follow=True):
-                log_text = log_line.decode('utf-8').strip()
-                print(f"Crawler: {log_text}")
+            # Don't block the main thread - let the container run and monitor progress separately
+            # The container will run independently and we'll check its status periodically
+            
+            # Start a background task to monitor progress without blocking
+            async def monitor_container_progress():
+                progress = 35
+                pages_archived = 0
+                current_depth = 1
+                container_id = container.id
                 
-                # Parse progress and page count from logs
-                if "pages crawled" in log_text.lower():
-                    progress = min(progress + 5, 80)
-                    # Try to extract page count from log line
-                    # Format examples: "10 pages crawled", "Crawled 15 pages", etc.
-                    import re
-                    page_match = re.search(r'(\d+)\s+pages?\s+crawled|crawled\s+(\d+)\s+pages?', log_text.lower())
-                    if page_match:
-                        pages_archived = int(page_match.group(1) or page_match.group(2))
-                        await job_manager.update_job(job_id, {"progress": progress, "pages_archived": pages_archived})
-                    else:
-                        await job_manager.update_job(job_id, {"progress": progress})
-                elif "finished" in log_text.lower() or "done" in log_text.lower():
-                    progress = 85
-                    # Try to extract final page count from completion message
-                    import re
-                    page_match = re.search(r'(\d+)\s+pages?\s+crawled|crawled\s+(\d+)\s+pages?|(\d+)\s+pages?\s+total', log_text.lower())
-                    if page_match:
-                        pages_archived = int(page_match.group(1) or page_match.group(2) or page_match.group(3))
-                    await job_manager.update_job(job_id, {"progress": progress, "pages_archived": pages_archived})
-                elif "error" in log_text.lower():
-                    print(f"Crawler error: {log_text}")
+                try:
+                    # Give container time to start and initialize
+                    await asyncio.sleep(5)
+                    
+                    # Check if container was created and is running using fresh reference
+                    try:
+                        current_container = docker_client.containers.get(container_id)
+                        print(f"DEBUG: Container {container_id} status: {current_container.status}")
+                        if current_container.status == 'exited':
+                            # Container completed successfully, handle completion
+                            print(f"DEBUG: Container completed successfully")
+                            await handle_container_completion(pages_archived, current_depth)
+                            return
+                        elif current_container.status != 'running':
+                            print(f"DEBUG: Container failed, status: {current_container.status}")
+                            await job_manager.update_job(job_id, {"status": "failed", "progress": 0})
+                            return
+                    except Exception as e:
+                        # Container creation failed or not found
+                        print(f"DEBUG: Failed to get container {container_id}: {e}")
+                        await job_manager.update_job(job_id, {"status": "failed", "progress": 0})
+                        return
+                    
+                    # Monitor container progress
+                    while True:
+                        try:
+                            # Check if container is still running using fresh reference
+                            current_container = docker_client.containers.get(container_id)
+                            if current_container.status != 'running':
+                                # Container finished - handle completion
+                                await handle_container_completion(pages_archived, current_depth)
+                                break
+                                
+                            # Get recent logs (last 50 lines) to check progress
+                            logs = current_container.logs(tail=50).decode('utf-8')
+                            
+                            # Count "Page Finished" events in recent logs
+                            import json
+                            log_lines = logs.strip().split('\n')
+                            recent_pages = 0
+                            
+                            for line in log_lines:
+                                try:
+                                    log_data = json.loads(line)
+                                    if log_data.get("context") == "pageStatus" and log_data.get("message") == "Page Finished":
+                                        recent_pages += 1
+                                except json.JSONDecodeError:
+                                    continue
+                            
+                            # Update progress if we found new pages
+                            if recent_pages > 0:
+                                # This is a rough estimate - we're counting recent pages
+                                pages_archived = max(pages_archived, recent_pages)
+                                progress = min(35 + int(pages_archived * 0.5), 85)
+                                
+                                await job_manager.update_job(job_id, {
+                                    "progress": progress, 
+                                    "pages_archived": pages_archived, 
+                                    "current_depth": current_depth
+                                })
+                                
+                        except Exception as e:
+                            # Container might have stopped or failed
+                            try:
+                                current_container = docker_client.containers.get(container_id)
+                                if current_container.status != 'running':
+                                    await job_manager.update_job(job_id, {"status": "failed", "progress": 0})
+                                    break
+                            except:
+                                await job_manager.update_job(job_id, {"status": "failed", "progress": 0})
+                                break
+                                
+                        # Wait before checking again
+                        await asyncio.sleep(5)
+                        
+                except Exception as e:
+                    # Any unhandled exception should mark job as failed
+                    print(f"DEBUG: Monitoring task failed with exception: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    await job_manager.update_job(job_id, {"status": "failed", "progress": 0})
+                    
+            async def handle_container_completion(pages_archived, current_depth):
+                """Handle container completion and file processing"""
+                try:
+                    # Check exit code
+                    result = container.wait()
+                    exit_code = result['StatusCode']
+                    
+                    if exit_code != 0:
+                        await job_manager.update_job(job_id, {"status": "failed", "progress": 0})
+                        return
+                    
+                    await job_manager.update_job(job_id, {"progress": 90})
+                    
+                    # Find the generated WACZ file
+                    wacz_files = []
+                    for root, _, files in os.walk(temp_dir):
+                        for file in files:
+                            if file.endswith('.wacz'):
+                                wacz_files.append(os.path.join(root, file))
+                    
+                    if not wacz_files:
+                        await job_manager.update_job(job_id, {"status": "failed", "progress": 0})
+                        return
+                    
+                    # Use the first WACZ file found
+                    wacz_file = wacz_files[0]
+                    
+                    # Save to local storage with simple filename for replayweb.page compatibility
+                    filename = f"{job_id[:8]}.wacz"
+                    await storage_manager.save_binary_archive(wacz_file, job_id, filename)
+                    
+                    await job_manager.update_job(job_id, {
+                        "status": "completed",
+                        "progress": 100,
+                        "completed_at": datetime.now().isoformat(),
+                        "archive_path": filename,
+                        "local_path": f"{job_id}/{filename}",
+                        "pages_archived": pages_archived,
+                        "current_depth": current_depth
+                    })
+                    
+                except Exception:
+                    await job_manager.update_job(job_id, {"status": "failed", "progress": 0})
+                finally:
+                    # Clean up temp directory after container completes
+                    try:
+                        shutil.rmtree(temp_dir)
+                    except Exception:
+                        pass
             
-            # Wait for container to complete
-            result = container.wait()
-            exit_code = result['StatusCode']
+            # Start the monitoring task and let it run independently
+            asyncio.create_task(monitor_container_progress())
             
-            if exit_code != 0:
-                raise Exception(f"Crawler failed with exit code {exit_code}")
-            
-            await job_manager.update_job(job_id, {"progress": 90})
-            
-            # Find the generated WACZ file
-            wacz_files = []
-            for root, dirs, files in os.walk(temp_dir):
-                for file in files:
-                    if file.endswith('.wacz'):
-                        wacz_files.append(os.path.join(root, file))
-            
-            if not wacz_files:
-                raise Exception("No WACZ file generated by crawler")
-            
-            # Use the first WACZ file found
-            wacz_file = wacz_files[0]
-            print(f"Found WACZ file: {wacz_file}")
-            
-            # Save to local storage with simple filename for replayweb.page compatibility
-            filename = f"{job_id[:8]}.wacz"
-            local_path = await storage_manager.save_binary_archive(wacz_file, job_id, filename)
-            
-            print(f"WACZ saved to local storage: {local_path}")
-            
-            await job_manager.update_job(job_id, {
-                "status": "completed",
-                "progress": 100,
-                "completed_at": datetime.now().isoformat(),
-                "archive_path": filename,
-                "local_path": f"{job_id}/{filename}",
-                "pages_archived": pages_archived
-            })
-            
-            print(f"Successfully created WACZ archive for {url}")
+            # Don't wait for container here - let it run independently
+            # The background task will monitor it and update the job status when done
+            return  # Exit the background task immediately, don't block the server
             
         finally:
-            # Clean up temp directory
-            try:
-                shutil.rmtree(temp_dir)
-                print(f"Cleaned up temp directory: {temp_dir}")
-            except Exception as cleanup_error:
-                print(f"Error cleaning up temp directory: {cleanup_error}")
+            # Don't clean up temp directory immediately - let container finish first
+            # The monitoring task will clean it up when container completes
+            pass
                 
     except Exception as e:
         await job_manager.update_job(job_id, {"status": "failed", "progress": 0})
-        print(f"Error running browsertrix-crawler: {e}")
+        pass
         import traceback
         traceback.print_exc()
 
@@ -1129,7 +1339,7 @@ def parse_crawler_progress(output: str) -> Optional[int]:
 async def upload_archive_to_gcs(job_id: str, local_path: str):
     """Background task to upload WACZ archive to Google Cloud Storage"""
     try:
-        print(f"Starting GCS upload for job {job_id}")
+        pass
         
         # Update job status to indicate upload in progress
         await job_manager.update_job(job_id, {"status": "uploading_gcs"})
@@ -1155,7 +1365,7 @@ async def upload_archive_to_gcs(job_id: str, local_path: str):
             blob_name = f"archives/{simple_filename}"
             blob = bucket.blob(blob_name)
             
-            print(f"Uploading {file_path} to gs://{bucket_name}/{blob_name}")
+            pass
             
             # Update progress
             await job_manager.update_job(job_id, {"progress": 50})
@@ -1172,7 +1382,7 @@ async def upload_archive_to_gcs(job_id: str, local_path: str):
             # Get public URL
             gcs_url = blob.public_url
             
-            print(f"Successfully uploaded to GCS: {gcs_url}")
+            pass
             
             # Update job with GCS URL and restore completed status
             await job_manager.update_job(job_id, {
@@ -1187,7 +1397,7 @@ async def upload_archive_to_gcs(job_id: str, local_path: str):
             
     except Exception as e:
         error_msg = str(e)
-        print(f"Error uploading to GCS: {error_msg}")
+        pass
         
         # Update job with error status and message
         await job_manager.update_job(job_id, {

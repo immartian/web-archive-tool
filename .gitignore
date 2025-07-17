@@ -9,7 +9,7 @@ env/
 ENV/
 
 # Credentials and environment
-sage-striker-294302-b89a8b7e205b.json
+google*.json
 .env
 
 # Runtime files
@@ -44,4 +44,4 @@ archives/
 # OS files
 .DS_Store
 Thumbs.db
-__pycache__/main.cpython-312.pyc
+__pycache__/
