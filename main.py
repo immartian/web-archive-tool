@@ -23,6 +23,14 @@ load_dotenv()
 
 app = FastAPI(title="Web Archive API - Local Docker")
 
+@app.on_event("startup")
+async def startup_event():
+    """Handle async startup tasks"""
+    try:
+        await cleanup_orphaned_jobs()
+    except Exception:
+        pass  # Don't let cleanup failures prevent startup
+
 # Add CORS middleware for replayweb.page integration
 app.add_middleware(
     CORSMiddleware,
@@ -92,11 +100,7 @@ try:
     # Clean up any orphaned browsertrix containers on startup
     cleanup_orphaned_containers()
     
-    # Update any jobs that were running when the app restarted
-    try:
-        asyncio.run(cleanup_orphaned_jobs())
-    except Exception as e:
-        pass  # Don't let cleanup failures prevent Docker client initialization
+    # Note: cleanup_orphaned_jobs() will be called during app startup instead
     
 except Exception as e:
     pass
