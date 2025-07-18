@@ -33,9 +33,53 @@ stop_service() {
     exit 0
 }
 
+# Function to get Yggdrasil IPv6 address (optional)
+get_yggdrasil_ipv6() {
+    # Try to get Yggdrasil IPv6 address from common interfaces
+    local ygg_addr=""
+    
+    # Try to find Yggdrasil IPv6 address
+    for interface in tun0 utun0 ygg0; do
+        if ip addr show $interface 2>/dev/null | grep -q "inet6.*200::/7"; then
+            ygg_addr=$(ip addr show $interface 2>/dev/null | grep "inet6.*200::/7" | head -1 | awk '{print $2}' | cut -d'/' -f1)
+            break
+        fi
+    done
+    
+    # Fallback: try ifconfig for macOS
+    if [ -z "$ygg_addr" ]; then
+        for interface in utun0 utun1 utun2; do
+            if ifconfig $interface 2>/dev/null | grep -q "inet6.*200:"; then
+                ygg_addr=$(ifconfig $interface 2>/dev/null | grep "inet6.*200:" | head -1 | awk '{print $2}')
+                break
+            fi
+        done
+    fi
+    
+    echo "$ygg_addr"  # Return empty string if not found
+}
+
 # Function to start the service
 start_service() {
-    echo "🚀 Starting Web Archive Tool..."
+    local bind_host="0.0.0.0"
+    local ipv6_mode=false
+    
+    # Check for IPv6 flag
+    if [ "$1" = "--ipv6" ]; then
+        ipv6_mode=true
+        echo "🌐 Starting Web Archive Tool with IPv6 support..."
+        ygg_addr=$(get_yggdrasil_ipv6)
+        
+        if [ -n "$ygg_addr" ]; then
+            bind_host="$ygg_addr"
+            echo "📍 Yggdrasil IPv6 address found: $ygg_addr"
+        else
+            bind_host="::"
+            echo "📍 Using standard IPv6 binding (::) - Yggdrasil not detected"
+        fi
+    else
+        echo "🚀 Starting Web Archive Tool..."
+    fi
 
     # Check if Docker is installed and running
     if ! command -v docker &> /dev/null; then
@@ -93,8 +137,13 @@ start_service() {
     export PORT=8080
 
     # Start the FastAPI server with uvicorn
-    echo "🚀 Starting FastAPI server with uvicorn..."
-    nohup uvicorn main:app --host 0.0.0.0 --port 8080 --reload > server.log 2>&1 &
+    if [ "$ipv6_mode" = true ]; then
+        echo "🚀 Starting FastAPI server with uvicorn on IPv6..."
+        nohup uvicorn main:app --host "$bind_host" --port 8080 --reload > server.log 2>&1 &
+    else
+        echo "🚀 Starting FastAPI server with uvicorn..."
+        nohup uvicorn main:app --host 0.0.0.0 --port 8080 --reload > server.log 2>&1 &
+    fi
     SERVER_PID=$!
     
     # Wait a moment for server to start
@@ -102,7 +151,18 @@ start_service() {
     
     # Check if server started successfully
     if kill -0 $SERVER_PID 2>/dev/null; then
-        echo "✅ Web Archive Tool is running at http://localhost:8080"
+        if [ "$ipv6_mode" = true ]; then
+            if [ -n "$ygg_addr" ]; then
+                echo "✅ Web Archive Tool is running on IPv6 at http://[$ygg_addr]:8080"
+                echo "🌐 Yggdrasil network address: [$ygg_addr]:8080"
+            else
+                echo "✅ Web Archive Tool is running on IPv6 at http://[::]:8080"
+                echo "🌐 IPv6 address: [::]:8080 (all interfaces)"
+            fi
+            echo "📡 Also accessible via localhost: http://localhost:8080"
+        else
+            echo "✅ Web Archive Tool is running at http://localhost:8080"
+        fi
         echo "📖 Check logs with: tail -f server.log"
         echo "🛑 Stop with: ./run.sh stop"
         echo "🔍 Server PID: $SERVER_PID"
@@ -113,7 +173,16 @@ start_service() {
     fi
 
     echo ""
-    echo "🌐 Access the web interface at: http://localhost:8080"
+    if [ "$ipv6_mode" = true ]; then
+        if [ -n "$ygg_addr" ]; then
+            echo "🌐 IPv6 (Yggdrasil): http://[$ygg_addr]:8080"
+        else
+            echo "🌐 IPv6 (Standard): http://[::]:8080"
+        fi
+        echo "🏠 Local access: http://localhost:8080"
+    else
+        echo "🌐 Access the web interface at: http://localhost:8080"
+    fi
     echo "📋 The tool now supports:"
     echo "   • Deep crawling (4 levels, up to 100 pages)"
     echo "   • Professional WACZ archives via browsertrix-crawler"
@@ -121,11 +190,17 @@ start_service() {
     echo "   • Cloud storage integration (Google Cloud Storage)"
     echo "   • replayweb.page integration for online playback"
     echo "   • Unified job management with stop/retry/delete controls"
+    if [ "$ipv6_mode" = true ]; then
+        echo "   • Yggdrasil IPv6 network accessibility"
+    fi
 }
 
 # Main script logic
 if [ "$1" = "stop" ]; then
     stop_service
+elif [ "$1" = "--ipv6" ]; then
+    # Start with IPv6 support
+    start_service --ipv6
 else
     # Default to start (stops previous instances first)
     start_service

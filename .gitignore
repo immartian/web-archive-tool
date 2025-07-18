@@ -44,4 +44,4 @@ archives/
 # OS files
 .DS_Store
 Thumbs.db
-__pycache__/
+__pycache__/__pycache__/
