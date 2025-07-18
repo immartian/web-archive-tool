@@ -1176,7 +1176,7 @@ async def run_browsertrix_crawler(job_id: str, url: str):
                         "STORE_USER": "1000",
                         "STORE_GROUP": "1000"
                     },
-                    remove=True,  # Auto-remove container when done
+                    remove=False,  # Keep container for debugging, clean up later
                     detach=True,
                     stdout=True,
                     stderr=True,
@@ -1332,6 +1332,15 @@ async def run_browsertrix_crawler(job_id: str, url: str):
                     # Clean up temp directory after container completes
                     try:
                         shutil.rmtree(temp_dir)
+                    except Exception:
+                        pass
+                    
+                    # Clean up container after job completes (success or failure)
+                    try:
+                        if docker_client and container_id:
+                            container = docker_client.containers.get(container_id)
+                            if container.status in ['exited', 'stopped']:
+                                container.remove()
                     except Exception:
                         pass
             
