@@ -909,6 +909,8 @@ async def stop_job(job_id: str):
             if container.status == "running":
                 container.stop(timeout=10)
                 container_stopped = True
+                # Remove the stopped container
+                container.remove()
         except Exception:
             # Container might not exist or already stopped
             pass
@@ -1218,9 +1220,9 @@ async def run_browsertrix_crawler(job_id: str, url: str):
                         if current_container.status == 'exited':
                             # Container completed successfully, handle completion
                             print(f"DEBUG: Container completed successfully")
-                            await handle_container_completion(pages_archived, current_depth)
+                            await handle_container_completion(pages_archived, current_depth, container_id)
                             return
-                        elif current_container.status != 'running':
+                        elif current_container.status not in ['running', 'created']:
                             print(f"DEBUG: Container failed, status: {current_container.status}")
                             await job_manager.update_job(job_id, {"status": "failed", "progress": 0})
                             return
@@ -1235,9 +1237,13 @@ async def run_browsertrix_crawler(job_id: str, url: str):
                         try:
                             # Check if container is still running using fresh reference
                             current_container = docker_client.containers.get(container_id)
-                            if current_container.status != 'running':
+                            if current_container.status == 'exited':
                                 # Container finished - handle completion
-                                await handle_container_completion(pages_archived, current_depth)
+                                await handle_container_completion(pages_archived, current_depth, container_id)
+                                break
+                            elif current_container.status not in ['running', 'created']:
+                                # Container failed with unexpected status
+                                await job_manager.update_job(job_id, {"status": "failed", "progress": 0})
                                 break
                                 
                             # Get recent logs (last 50 lines) to check progress
@@ -1272,8 +1278,11 @@ async def run_browsertrix_crawler(job_id: str, url: str):
                             # Container might have stopped or failed
                             try:
                                 current_container = docker_client.containers.get(container_id)
-                                if current_container.status != 'running':
-                                    await handle_container_completion(pages_archived, current_depth)
+                                if current_container.status == 'exited':
+                                    await handle_container_completion(pages_archived, current_depth, container_id)
+                                    break
+                                elif current_container.status not in ['running', 'created']:
+                                    await job_manager.update_job(job_id, {"status": "failed", "progress": 0})
                                     break
                             except:
                                 await job_manager.update_job(job_id, {"status": "failed", "progress": 0})
@@ -1289,7 +1298,7 @@ async def run_browsertrix_crawler(job_id: str, url: str):
                     traceback.print_exc()
                     await job_manager.update_job(job_id, {"status": "failed", "progress": 0})
                     
-            async def handle_container_completion(pages_archived, current_depth):
+            async def handle_container_completion(pages_archived, current_depth, container_id):
                 """Handle container completion and file processing"""
                 try:
                     # Check exit code
@@ -1330,21 +1339,21 @@ async def run_browsertrix_crawler(job_id: str, url: str):
                         "current_depth": current_depth
                     })
                     
+                    # Clean up container after successful completion
+                    try:
+                        if docker_client and container_id:
+                            container = docker_client.containers.get(container_id)
+                            if container.status in ['exited', 'stopped']:
+                                container.remove()
+                    except Exception:
+                        pass
+                    
                 except Exception:
                     await job_manager.update_job(job_id, {"status": "failed", "progress": 0})
                 finally:
                     # Clean up temp directory after container completes
                     try:
                         shutil.rmtree(temp_dir)
-                    except Exception:
-                        pass
-                    
-                    # Clean up container after job completes (success or failure)
-                    try:
-                        if docker_client and container_id:
-                            container = docker_client.containers.get(container_id)
-                            if container.status in ['exited', 'stopped']:
-                                container.remove()
                     except Exception:
                         pass
             
