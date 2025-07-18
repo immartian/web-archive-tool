@@ -93,7 +93,10 @@ try:
     cleanup_orphaned_containers()
     
     # Update any jobs that were running when the app restarted
-    asyncio.run(cleanup_orphaned_jobs())
+    try:
+        asyncio.run(cleanup_orphaned_jobs())
+    except Exception as e:
+        pass  # Don't let cleanup failures prevent Docker client initialization
     
 except Exception as e:
     pass

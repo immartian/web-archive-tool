@@ -25,10 +25,10 @@ stop_service() {
     echo "🐳 Cleaning up Docker containers..."
     docker container prune -f >/dev/null 2>&1 || true
     
-    # Check if anything is still running on port 8080
-    if lsof -i :8080 > /dev/null 2>&1; then
-        echo "⚠️  Something is still running on port 8080"
-        echo "Use: sudo lsof -i :8080 to check what's running"
+    # Check if anything is still listening on port 8080
+    if lsof -i :8080 -sTCP:LISTEN > /dev/null 2>&1; then
+        echo "⚠️  Something is still listening on port 8080"
+        echo "Use: sudo lsof -i :8080 -sTCP:LISTEN to check what's listening"
     else
         echo "✅ Port 8080 is now free"
     fi
