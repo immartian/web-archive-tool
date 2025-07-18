@@ -1235,12 +1235,16 @@ async def run_browsertrix_crawler(job_id: str, url: str):
                         try:
                             # Check if container is still running using fresh reference
                             current_container = docker_client.containers.get(container_id)
+                            print(f"DEBUG: Monitoring - Container {container_id} status: {current_container.status}")
+                            
                             if current_container.status == 'exited':
                                 # Container finished - handle completion
+                                print(f"DEBUG: Container exited, handling completion")
                                 await handle_container_completion(pages_archived, current_depth)
                                 break
                             elif current_container.status not in ['running', 'created']:
                                 # Container failed
+                                print(f"DEBUG: Container failed with status: {current_container.status}")
                                 await job_manager.update_job(job_id, {"status": "failed", "progress": 0})
                                 break
                                 
@@ -1274,12 +1278,20 @@ async def run_browsertrix_crawler(job_id: str, url: str):
                                 
                         except Exception as e:
                             # Container might have stopped or failed
+                            print(f"DEBUG: Exception in monitoring loop: {e}")
                             try:
                                 current_container = docker_client.containers.get(container_id)
-                                if current_container.status != 'running':
+                                print(f"DEBUG: Exception handler - Container status: {current_container.status}")
+                                if current_container.status == 'exited':
+                                    print(f"DEBUG: Container exited in exception handler, handling completion")
+                                    await handle_container_completion(pages_archived, current_depth)
+                                    break
+                                elif current_container.status not in ['running', 'created']:
+                                    print(f"DEBUG: Container failed in exception handler: {current_container.status}")
                                     await job_manager.update_job(job_id, {"status": "failed", "progress": 0})
                                     break
-                            except:
+                            except Exception as e2:
+                                print(f"DEBUG: Failed to get container in exception handler: {e2}")
                                 await job_manager.update_job(job_id, {"status": "failed", "progress": 0})
                                 break
                                 
