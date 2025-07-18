@@ -1216,11 +1216,11 @@ async def run_browsertrix_crawler(job_id: str, url: str):
                         current_container = docker_client.containers.get(container_id)
                         print(f"DEBUG: Container {container_id} status: {current_container.status}")
                         if current_container.status == 'exited':
-                            # Container completed successfully, handle completion
-                            print(f"DEBUG: Container completed successfully")
+                            # Container completed, handle completion
+                            print(f"DEBUG: Container completed")
                             await handle_container_completion(pages_archived, current_depth)
                             return
-                        elif current_container.status != 'running':
+                        elif current_container.status not in ['running', 'created']:
                             print(f"DEBUG: Container failed, status: {current_container.status}")
                             await job_manager.update_job(job_id, {"status": "failed", "progress": 0})
                             return
@@ -1235,9 +1235,13 @@ async def run_browsertrix_crawler(job_id: str, url: str):
                         try:
                             # Check if container is still running using fresh reference
                             current_container = docker_client.containers.get(container_id)
-                            if current_container.status != 'running':
+                            if current_container.status == 'exited':
                                 # Container finished - handle completion
                                 await handle_container_completion(pages_archived, current_depth)
+                                break
+                            elif current_container.status not in ['running', 'created']:
+                                # Container failed
+                                await job_manager.update_job(job_id, {"status": "failed", "progress": 0})
                                 break
                                 
                             # Get recent logs (last 50 lines) to check progress
