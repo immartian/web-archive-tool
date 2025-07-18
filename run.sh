@@ -21,6 +21,10 @@ stop_service() {
     pkill -f "python.*main.py" 2>/dev/null || true
     pkill -f "uvicorn.*main:app" 2>/dev/null || true
     
+    # Clean up any remaining Docker containers
+    echo "🐳 Cleaning up Docker containers..."
+    docker container prune -f >/dev/null 2>&1 || true
+    
     # Check if anything is still running on port 8080
     if lsof -i :8080 > /dev/null 2>&1; then
         echo "⚠️  Something is still running on port 8080"

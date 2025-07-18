@@ -89,11 +89,11 @@ try:
     # Test the connection
     docker_client.ping()
     
-    # Clean up any orphaned browsertrix containers on startup - but only if they've been running for a very long time
-    # cleanup_orphaned_containers()  # Disabled for now - too aggressive
+    # Clean up any orphaned browsertrix containers on startup
+    cleanup_orphaned_containers()
     
     # Update any jobs that were running when the app restarted
-    # asyncio.run(cleanup_orphaned_jobs())  # Disabled for now
+    asyncio.run(cleanup_orphaned_jobs())
     
 except Exception as e:
     pass
@@ -119,7 +119,8 @@ def init_db():
             crawler_type TEXT,
             crawler_reason TEXT,
             complexity_score INTEGER DEFAULT 0,
-            gcs_url TEXT
+            gcs_url TEXT,
+            container_id TEXT
         )
     ''')
     
@@ -147,6 +148,13 @@ def init_db():
     # Add current_depth column if it doesn't exist (for existing databases)
     try:
         cursor.execute('ALTER TABLE archive_jobs ADD COLUMN current_depth INTEGER DEFAULT 1')
+    except sqlite3.OperationalError:
+        # Column already exists
+        pass
+    
+    # Add container_id column if it doesn't exist (for existing databases)
+    try:
+        cursor.execute('ALTER TABLE archive_jobs ADD COLUMN container_id TEXT')
     except sqlite3.OperationalError:
         # Column already exists
         pass
@@ -875,7 +883,7 @@ async def retry_archive(job_id: str, background_tasks: BackgroundTasks):
 
 @app.post("/api/stop/{job_id}")
 async def stop_job(job_id: str):
-    """Stop an active job"""
+    """Stop an active job and its Docker container"""
     
     # Get the job to check if it exists
     existing_job = await job_manager.get_job(job_id)
@@ -886,13 +894,29 @@ async def stop_job(job_id: str):
     if existing_job["status"] not in ["started", "crawling", "preparing", "uploading_gcs"]:
         raise HTTPException(status_code=400, detail="Only active jobs can be stopped")
     
+    # Stop the Docker container if it exists
+    container_stopped = False
+    if existing_job.get("container_id") and docker_client:
+        try:
+            container = docker_client.containers.get(existing_job["container_id"])
+            if container.status == "running":
+                container.stop(timeout=10)
+                container_stopped = True
+        except Exception:
+            # Container might not exist or already stopped
+            pass
+    
     # Update job status to stopped
     await job_manager.update_job(job_id, {
         "status": "stopped",
         "completed_at": datetime.now().isoformat()
     })
     
-    return {"message": "Job stopped successfully", "job_id": job_id}
+    message = "Job stopped successfully"
+    if container_stopped:
+        message += " and Docker container stopped"
+    
+    return {"message": message, "job_id": job_id}
 
 @app.delete("/api/delete/{job_id}")
 async def delete_job(job_id: str):
@@ -1149,7 +1173,7 @@ async def run_browsertrix_crawler(job_id: str, url: str):
                         "STORE_USER": "1000",
                         "STORE_GROUP": "1000"
                     },
-                    remove=False,  # Don't remove so we can debug
+                    remove=True,  # Auto-remove container when done
                     detach=True,
                     stdout=True,
                     stderr=True,
@@ -1172,6 +1196,9 @@ async def run_browsertrix_crawler(job_id: str, url: str):
                 pages_archived = 0
                 current_depth = 1
                 container_id = container.id
+                
+                # Store container ID in database for cleanup
+                await job_manager.update_job(job_id, {"container_id": container_id})
                 
                 try:
                     # Give container time to start and initialize
