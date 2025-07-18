@@ -20,6 +20,13 @@ stop_service() {
     # Kill any remaining Python/uvicorn processes
     pkill -f "python.*main.py" 2>/dev/null || true
     pkill -f "uvicorn.*main:app" 2>/dev/null || true
+    pkill -f "uvicorn" 2>/dev/null || true
+    
+    # Force kill any processes still using port 8080
+    if lsof -i :8080 -sTCP:LISTEN > /dev/null 2>&1; then
+        echo "Force killing processes on port 8080..."
+        lsof -ti :8080 -sTCP:LISTEN | xargs kill -9 2>/dev/null || true
+    fi
     
     # Clean up any remaining Docker containers
     echo "🐳 Cleaning up Docker containers..."
