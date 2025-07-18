@@ -1304,8 +1304,10 @@ async def run_browsertrix_crawler(job_id: str, url: str):
                     # Check exit code
                     result = container.wait()
                     exit_code = result['StatusCode']
+                    print(f"DEBUG: Container exit code: {exit_code}")
                     
                     if exit_code != 0:
+                        print(f"DEBUG: Container failed with exit code: {exit_code}")
                         await job_manager.update_job(job_id, {"status": "failed", "progress": 0})
                         return
                     
@@ -1318,17 +1320,22 @@ async def run_browsertrix_crawler(job_id: str, url: str):
                             if file.endswith('.wacz'):
                                 wacz_files.append(os.path.join(root, file))
                     
+                    print(f"DEBUG: Found {len(wacz_files)} WACZ files in {temp_dir}")
                     if not wacz_files:
+                        print(f"DEBUG: No WACZ files found, marking as failed")
                         await job_manager.update_job(job_id, {"status": "failed", "progress": 0})
                         return
                     
                     # Use the first WACZ file found
                     wacz_file = wacz_files[0]
+                    print(f"DEBUG: Using WACZ file: {wacz_file}")
                     
                     # Save to local storage with simple filename for replayweb.page compatibility
                     filename = f"{job_id[:8]}.wacz"
+                    print(f"DEBUG: Saving to storage as: {filename}")
                     await storage_manager.save_binary_archive(wacz_file, job_id, filename)
                     
+                    print(f"DEBUG: Marking job as completed")
                     await job_manager.update_job(job_id, {
                         "status": "completed",
                         "progress": 100,
@@ -1338,6 +1345,7 @@ async def run_browsertrix_crawler(job_id: str, url: str):
                         "pages_archived": pages_archived,
                         "current_depth": current_depth
                     })
+                    print(f"DEBUG: Job marked as completed successfully")
                     
                     # Clean up container after successful completion
                     try:
@@ -1348,7 +1356,10 @@ async def run_browsertrix_crawler(job_id: str, url: str):
                     except Exception:
                         pass
                     
-                except Exception:
+                except Exception as e:
+                    print(f"DEBUG: Exception in completion handler: {e}")
+                    import traceback
+                    traceback.print_exc()
                     await job_manager.update_job(job_id, {"status": "failed", "progress": 0})
                 finally:
                     # Clean up temp directory after container completes
