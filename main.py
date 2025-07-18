@@ -1301,8 +1301,9 @@ async def run_browsertrix_crawler(job_id: str, url: str):
             async def handle_container_completion(pages_archived, current_depth, container_id):
                 """Handle container completion and file processing"""
                 try:
-                    # Check exit code
-                    result = container.wait()
+                    # Get container and check exit code
+                    container_obj = docker_client.containers.get(container_id)
+                    result = container_obj.wait()
                     exit_code = result['StatusCode']
                     print(f"DEBUG: Container exit code: {exit_code}")
                     
@@ -1350,9 +1351,8 @@ async def run_browsertrix_crawler(job_id: str, url: str):
                     # Clean up container after successful completion
                     try:
                         if docker_client and container_id:
-                            container = docker_client.containers.get(container_id)
-                            if container.status in ['exited', 'stopped']:
-                                container.remove()
+                            if container_obj.status in ['exited', 'stopped']:
+                                container_obj.remove()
                     except Exception:
                         pass
                     
