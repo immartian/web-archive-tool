@@ -127,7 +127,8 @@ def init_db():
             crawler_reason TEXT,
             complexity_score INTEGER DEFAULT 0,
             gcs_url TEXT,
-            container_id TEXT
+            container_id TEXT,
+            file_size INTEGER DEFAULT 0
         )
     ''')
     
@@ -162,6 +163,13 @@ def init_db():
     # Add container_id column if it doesn't exist (for existing databases)
     try:
         cursor.execute('ALTER TABLE archive_jobs ADD COLUMN container_id TEXT')
+    except sqlite3.OperationalError:
+        # Column already exists
+        pass
+    
+    # Add file_size column if it doesn't exist (for existing databases)
+    try:
+        cursor.execute('ALTER TABLE archive_jobs ADD COLUMN file_size INTEGER DEFAULT 0')
     except sqlite3.OperationalError:
         # Column already exists
         pass
@@ -496,6 +504,13 @@ async def get_frontend():
                 return 'active';
             }
 
+            function formatFileSize(bytes) {
+                if (!bytes || bytes === 0) return '';
+                const sizes = ['B', 'KB', 'MB', 'GB'];
+                const i = Math.floor(Math.log(bytes) / Math.log(1024));
+                return Math.round(bytes / Math.pow(1024, i) * 100) / 100 + ' ' + sizes[i];
+            }
+
             function createJobHTML(job) {
                 // Ensure all required fields exist
                 if (!job || !job.job_id || !job.url || !job.status) {
@@ -564,9 +579,15 @@ async def get_frontend():
                 if (job.pages_archived > 0 || job.current_depth > 0) {
                     const pages = job.pages_archived || 0;
                     const depth = job.current_depth || 1;
-                    const maxDepth = 4; // Our configured max depth
+                    const maxDepth = 6; // Our configured max depth
                     
                     crawlInfo = `<div><strong>Crawling:</strong> ${pages} pages • Level ${depth}/${maxDepth}</div>`;
+                }
+
+                // Add file size information
+                let sizeInfo = '';
+                if (job.file_size > 0) {
+                    sizeInfo = `<div><strong>Archive Size:</strong> ${formatFileSize(job.file_size)}</div>`;
                 }
 
                 return `
@@ -578,6 +599,7 @@ async def get_frontend():
                         </div>
                         <div>Progress: ${progressWidth}%</div>
                         ${crawlInfo}
+                        ${sizeInfo}
                         <div><strong>Started:</strong> ${startedDate}</div>
                         ${completedDate ? `<div><strong>Completed:</strong> ${completedDate}</div>` : ''}
                         ${job.local_path ? `<div><strong>Storage:</strong> Local Storage</div>` : ''}
@@ -654,6 +676,7 @@ async def get_frontend():
                     showMessage(`Retry error: ${error.message}`, 'error');
                 }
             }
+
 
             async function stopJob(jobId) {
                 if (!confirm('Are you sure you want to stop this job?')) {
@@ -887,6 +910,7 @@ async def retry_archive(job_id: str, background_tasks: BackgroundTasks):
     background_tasks.add_task(run_browsertrix_crawler, job_id, existing_job["url"])
     
     return {"job_id": job_id, "status": "restarted"}
+
 
 @app.post("/api/stop/{job_id}")
 async def stop_job(job_id: str):
@@ -1132,17 +1156,19 @@ async def run_browsertrix_crawler(job_id: str, url: str):
             crawler_config = {
                 "url": url,
                 "collection": f"archive-{job_id}",
-                "depth": 4,  # Increased depth for more comprehensive crawling
-                "limit": 100,  # Increased page limit
-                "timeout": 900,  # Increased timeout to 15 minutes
-                "workers": 2,
+                "depth": 6,  # Increased depth for deeper crawling
+                "limit": 200,  # Increased page limit
+                "timeout": 1800,  # Increased timeout to 30 minutes
+                "workers": 3,  # More workers for faster crawling
                 "screenshot": "view",
-                "screencastTimeout": 10,
+                "screencastTimeout": 15,
                 "behaviors": "autoscroll,autoplay,autofetch,siteSpecific",
                 "userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-                "scopeType": "prefix", 
-                "include": "same-domain"
-                # Removed extraHops to focus on the target domain only
+                "scopeType": "host",  # Changed from "prefix" to "host" for broader crawling
+                "include": "same-domain",
+                "extraHops": 1,  # Allow one extra hop to find more content
+                "delay": 0,  # No delay for faster crawling
+                "maxLoadWaitTime": 10000  # Wait up to 10 seconds for page loads
             }
             
             # Build crawler command
@@ -1160,6 +1186,9 @@ async def run_browsertrix_crawler(job_id: str, url: str):
                 "--userAgent", crawler_config["userAgent"],
                 "--scopeType", crawler_config["scopeType"],
                 "--include", crawler_config["include"],
+                "--extraHops", str(crawler_config["extraHops"]),
+                "--delay", str(crawler_config["delay"]),
+                "--maxLoadWaitTime", str(crawler_config["maxLoadWaitTime"]),
                 "--generateWACZ",
                 "--text",
                 "--logging", "info"
@@ -1249,7 +1278,7 @@ async def run_browsertrix_crawler(job_id: str, url: str):
                             # Get recent logs (last 50 lines) to check progress
                             logs = current_container.logs(tail=50).decode('utf-8')
                             
-                            # Count "Page Finished" events in recent logs
+                            # Count page activity in recent logs
                             import json
                             log_lines = logs.strip().split('\n')
                             recent_pages = 0
@@ -1257,10 +1286,17 @@ async def run_browsertrix_crawler(job_id: str, url: str):
                             for line in log_lines:
                                 try:
                                     log_data = json.loads(line)
-                                    if log_data.get("context") == "pageStatus" and log_data.get("message") == "Page Finished":
+                                    # Look for various page completion indicators
+                                    if (log_data.get("context") == "pageStatus" and log_data.get("message") == "Page Finished") or \
+                                       (log_data.get("context") == "general" and "moving on to next page" in log_data.get("message", "")) or \
+                                       (log_data.get("context") == "worker" and log_data.get("message") == "Starting page"):
                                         recent_pages += 1
                                 except json.JSONDecodeError:
                                     continue
+                            
+                            # Debug: show what we found
+                            if recent_pages > 0:
+                                print(f"DEBUG: Found {recent_pages} page events in recent logs")
                             
                             # Update progress if we found new pages
                             if recent_pages > 0:
@@ -1336,6 +1372,10 @@ async def run_browsertrix_crawler(job_id: str, url: str):
                     print(f"DEBUG: Saving to storage as: {filename}")
                     await storage_manager.save_binary_archive(wacz_file, job_id, filename)
                     
+                    # Get file size
+                    file_size = os.path.getsize(wacz_file)
+                    print(f"DEBUG: Archive file size: {file_size} bytes")
+                    
                     print(f"DEBUG: Marking job as completed")
                     await job_manager.update_job(job_id, {
                         "status": "completed",
@@ -1344,7 +1384,8 @@ async def run_browsertrix_crawler(job_id: str, url: str):
                         "archive_path": filename,
                         "local_path": f"{job_id}/{filename}",
                         "pages_archived": pages_archived,
-                        "current_depth": current_depth
+                        "current_depth": current_depth,
+                        "file_size": file_size
                     })
                     print(f"DEBUG: Job marked as completed successfully")
                     
@@ -1385,6 +1426,7 @@ async def run_browsertrix_crawler(job_id: str, url: str):
         pass
         import traceback
         traceback.print_exc()
+
 
 def parse_crawler_progress(output: str) -> Optional[int]:
     """Parse progress from crawler output"""
