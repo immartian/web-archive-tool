@@ -142,7 +142,8 @@ services:
 2. **Submit URL**: Enter a website URL to archive
 3. **Monitor Progress**: Watch real-time progress updates
 4. **Download Archives**: Access completed archives via download links
-5. **Playback**: Use replayweb.page integration for WACZ files
+5. **Playback**: Use replayweb.page for WACZ files
+6. **IPFS Integration**: After uploading your archive to IPFS, use the `ipfs://<CID>/archive.wacz` URL in ReplayWeb.Page for decentralized playback.
 
 ### API Endpoints
 
@@ -190,8 +191,19 @@ docker_client.containers.run(
 ```
 
 ## Storage Management
+#### Cache-Control Header
 
-### Local Storage Structure
+For optimal streaming and playback in replayweb.page, set the `Cache-Control` header on your WACZ files in Google Cloud Storage. This allows browsers and replayweb.page to cache the archive efficiently, improving performance and reducing repeated requests.
+
+Recommended setting:
+```bash
+gsutil setmeta -h "Cache-Control:public,max-age=3600" gs://your-bucket/path/to/archive.wacz
+```
+
+You can adjust `max-age` as needed for your use case. Ensure that `Cache-Control` is included in your bucket's CORS `responseHeader` list.
+
+
+### Local & Decentralized Storage Structure
 
 ```
 archives/
@@ -203,6 +215,32 @@ archives/
 │   └── metadata.json
 └── ...
 ```
+
+#### IPFS Support
+
+You can now store and access web archives using IPFS for decentralized, peer-to-peer storage. ReplayWeb.Page supports loading archives via the `ipfs://` URL scheme.
+
+- **Upload to IPFS**: Use an IPFS node or pinning service to add your WACZ files. Example:
+  ```bash
+  ipfs add /path/to/archive.wacz
+  ```
+  This returns a CID (Content Identifier) for your file.
+- **Access via ReplayWeb.Page**: Use the following URL format:
+  ```
+  ipfs://<CID>/archive.wacz
+  ```
+- **Migration**: If you previously used Google Cloud Storage, you can migrate by uploading your archives to IPFS and updating your links to use the `ipfs://` scheme.
+
+#### Supported Storage Schemes
+
+ReplayWeb.Page supports loading archives from:
+- `https://` (HTTP/S)
+- `file://` (local files)
+- `s3://` (Amazon S3)
+- `googledrive://` (Google Drive)
+- `ipfs://` (IPFS)
+
+See [ReplayWeb.Page Supported URLs](https://replayweb.page/docs/url-schemes/) for details.
 
 ### Database Schema
 
